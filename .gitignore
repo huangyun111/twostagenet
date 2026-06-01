@@ -18,13 +18,13 @@ conda-meta/
 
 # Data / outputs
 data/
-datasets/
 logs/
 runs/
 outputs/
 results/
 checkpoints/
 weights/
+checkpoints_stage1_prior_debug/
 
 # Model files
 *.pth
