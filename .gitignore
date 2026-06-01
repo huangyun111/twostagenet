@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Environment
+.venv/
+venv/
+env/
+conda-meta/
+
+# VS Code
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data / outputs
+data/
+datasets/
+logs/
+runs/
+outputs/
+results/
+checkpoints/
+weights/
+
+# Model files
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.onnx
+
+# Numpy cache / large arrays
+*.npy
+*.npz
+
+# System
+.DS_Store
+Thumbs.db
