@@ -150,20 +150,24 @@ def save_visualization(
     target_polar = target[0].detach().cpu()
     pred_polar = pred_dict["polar_prior"][0].detach().cpu()
     confidence = pred_dict["confidence"][0].detach().cpu()
+    aolp_reliability = torch.clamp((target_polar[0] - 0.03) / (0.15 - 0.03), 0.0, 1.0)
+    confidence_aolp = confidence[1:3].mean(dim=0)
 
     panels = [
         ("RGB", rgb_image, None),
         ("Target DoLP", target_polar[0].numpy(), (0.0, 1.0)),
         ("Pred DoLP", pred_polar[0].numpy(), (0.0, 1.0)),
         ("Abs DoLP Error", torch.abs(pred_polar[0] - target_polar[0]).numpy(), (0.0, 1.0)),
+        ("AoLP Reliability", aolp_reliability.numpy(), (0.0, 1.0)),
         ("Confidence DoLP", confidence[0].numpy(), (0.0, 1.0)),
+        ("Confidence AoLP", confidence_aolp.numpy(), (0.0, 1.0)),
         ("Target cos2", to_display_map(target_polar[1], (-1.0, 1.0)), (0.0, 1.0)),
         ("Pred cos2", to_display_map(pred_polar[1], (-1.0, 1.0)), (0.0, 1.0)),
         ("Target sin2", to_display_map(target_polar[2], (-1.0, 1.0)), (0.0, 1.0)),
         ("Pred sin2", to_display_map(pred_polar[2], (-1.0, 1.0)), (0.0, 1.0)),
     ]
 
-    fig, axes = plt.subplots(3, 3, figsize=(12, 12))
+    fig, axes = plt.subplots(3, 4, figsize=(16, 12))
     for axis, (title, image, value_range) in zip(axes.flat, panels):
         if image.ndim == 3:
             axis.imshow(image)
@@ -171,6 +175,8 @@ def save_visualization(
             vmin, vmax = value_range if value_range is not None else (None, None)
             axis.imshow(image, cmap="gray", vmin=vmin, vmax=vmax)
         axis.set_title(title)
+        axis.axis("off")
+    for axis in list(axes.flat)[len(panels):]:
         axis.axis("off")
     fig.tight_layout()
     fig.savefig(path, dpi=150)
@@ -193,9 +199,13 @@ def train_one_epoch(
         "loss": 0.0,
         "loss_dolp": 0.0,
         "loss_aolp": 0.0,
+        "loss_conf": 0.0,
         "loss_unc": 0.0,
         "loss_lowfreq": 0.0,
         "loss_edge": 0.0,
+        "mean_aolp_reliability": 0.0,
+        "mean_conf_dolp": 0.0,
+        "mean_conf_aolp": 0.0,
     }
     num_samples = 0
     vis_data = None
@@ -279,9 +289,13 @@ def main() -> None:
             f"loss={metrics['loss']:.6f} | "
             f"loss_dolp={metrics['loss_dolp']:.6f} | "
             f"loss_aolp={metrics['loss_aolp']:.6f} | "
+            f"loss_conf={metrics['loss_conf']:.6f} | "
             f"loss_unc={metrics['loss_unc']:.6f} | "
             f"loss_lowfreq={metrics['loss_lowfreq']:.6f} | "
             f"loss_edge={metrics['loss_edge']:.6f} | "
+            f"aolp_rel={metrics['mean_aolp_reliability']:.6f} | "
+            f"conf_dolp={metrics['mean_conf_dolp']:.6f} | "
+            f"conf_aolp={metrics['mean_conf_aolp']:.6f} | "
             f"lr={format_lrs(optimizer)}"
         )
         append_log(log_path, message)
