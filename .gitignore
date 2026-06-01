@@ -25,6 +25,7 @@ results/
 checkpoints/
 weights/
 checkpoints_stage1_prior_debug/
+PolarAnything-main/
 
 # Model files
 *.pth
