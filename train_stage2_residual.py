@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -145,7 +146,7 @@ def build_models(
     args: argparse.Namespace,
     device: torch.device,
 ) -> tuple[AutoencoderKL, DDPMScheduler, Stage2ResidualDiffusionModel]:
-    checkpoint = args.pretrained_model_name_or_path
+    checkpoint = resolve_pretrained_model_path(args.pretrained_model_name_or_path)
     tokenizer = CLIPTokenizer.from_pretrained(checkpoint, subfolder="tokenizer")
     text_encoder = CLIPTextModel.from_pretrained(checkpoint, subfolder="text_encoder")
     vae = AutoencoderKL.from_pretrained(checkpoint, subfolder="vae")
@@ -172,6 +173,70 @@ def build_models(
     vae.to(device)
     model.to(device)
     return vae, noise_scheduler, model
+
+
+def resolve_pretrained_model_path(model_name_or_path: str) -> str:
+    model_path = Path(model_name_or_path).expanduser()
+    if model_path.exists():
+        return str(model_path)
+
+    local_snapshot = find_local_hf_snapshot(model_name_or_path)
+    if local_snapshot is not None:
+        print(f"Using local Hugging Face snapshot: {local_snapshot}", flush=True)
+        return str(local_snapshot)
+
+    return model_name_or_path
+
+
+def find_local_hf_snapshot(repo_id: str) -> Path | None:
+    if "/" not in repo_id:
+        return None
+
+    repo_cache_name = "models--" + repo_id.replace("/", "--")
+    candidates: list[Path] = []
+
+    hf_hub_cache = os.environ.get("HF_HUB_CACHE")
+    if hf_hub_cache:
+        candidates.append(Path(hf_hub_cache).expanduser() / repo_cache_name)
+
+    hf_home = os.environ.get("HF_HOME")
+    if hf_home:
+        candidates.append(Path(hf_home).expanduser() / "hub" / repo_cache_name)
+
+    candidates.append(Path.home() / "Documents" / "hf_cache" / "hub" / repo_cache_name)
+    candidates.append(Path.home() / ".cache" / "huggingface" / "hub" / repo_cache_name)
+
+    for repo_cache_dir in candidates:
+        snapshot_dir = choose_complete_snapshot(repo_cache_dir / "snapshots")
+        if snapshot_dir is not None:
+            return snapshot_dir
+    return None
+
+
+def choose_complete_snapshot(snapshots_dir: Path) -> Path | None:
+    if not snapshots_dir.is_dir():
+        return None
+
+    snapshots = sorted(
+        (path for path in snapshots_dir.iterdir() if path.is_dir()),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for snapshot in snapshots:
+        if is_complete_sd_snapshot(snapshot):
+            return snapshot
+    return None
+
+
+def is_complete_sd_snapshot(snapshot: Path) -> bool:
+    required_files = (
+        "vae/config.json",
+        "unet/config.json",
+        "text_encoder/config.json",
+        "tokenizer/tokenizer_config.json",
+        "scheduler/scheduler_config.json",
+    )
+    return all((snapshot / path).is_file() for path in required_files)
 
 
 def load_author_checkpoint(
