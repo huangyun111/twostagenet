@@ -41,10 +41,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=4e-5)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--save_dir", type=str, default="./checkpoints_stage2_residual")
+    parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--max_train_samples", type=int, default=None)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--log_freq", type=int, default=10)
     parser.add_argument("--save_freq", type=int, default=500)
+    parser.add_argument(
+        "--save_total_limit",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of numbered step_*.pth checkpoints to keep. "
+            "Set 0 to keep only last.pth."
+        ),
+    )
     parser.add_argument("--prompt", type=str, default="denoised polarized images")
     parser.add_argument("--vae_scaling_factor", type=float, default=0.18215)
     parser.add_argument("--seed", type=int, default=42)
@@ -132,6 +142,8 @@ def build_dataloader(args: argparse.Namespace) -> DataLoader:
         if args.max_train_samples <= 0:
             raise ValueError("max_train_samples must be positive or None.")
         dataset = Subset(dataset, range(min(args.max_train_samples, len(dataset))))
+    if args.save_total_limit is not None and args.save_total_limit < 0:
+        raise ValueError("save_total_limit must be non-negative or None.")
 
     return DataLoader(
         dataset,
@@ -319,18 +331,67 @@ def save_checkpoint(
     filename: str,
 ) -> None:
     save_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "epoch": epoch,
-            "global_step": global_step,
-            "unet_state_dict": model.unet.state_dict(),
-            "controlnet_state_dict": model.controlnet.state_dict(),
-            "condition_adapter_state_dict": model.condition_adapter.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "args": vars(args),
-        },
-        save_dir / filename,
+    checkpoint = {
+        "epoch": epoch,
+        "global_step": global_step,
+        "unet_state_dict": model.unet.state_dict(),
+        "controlnet_state_dict": model.controlnet.state_dict(),
+        "condition_adapter_state_dict": model.condition_adapter.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "args": vars(args),
+    }
+    torch.save(checkpoint, save_dir / filename)
+
+
+def prune_step_checkpoints(save_dir: Path, save_total_limit: int | None) -> None:
+    if save_total_limit is None:
+        return
+
+    step_checkpoints = sorted(save_dir.glob("step_*.pth"))
+    while len(step_checkpoints) > save_total_limit:
+        old_checkpoint = step_checkpoints.pop(0)
+        old_checkpoint.unlink()
+        print(f"Deleted old checkpoint: {old_checkpoint}", flush=True)
+
+
+def load_resume_checkpoint(
+    model: Stage2ResidualDiffusionModel,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    checkpoint_path: str | None,
+) -> tuple[int, int]:
+    checkpoint_path = normalize_optional_path(checkpoint_path)
+    if checkpoint_path is None:
+        return 0, 0
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    model.unet.load_state_dict(strip_module_prefix(checkpoint["unet_state_dict"]))
+    model.controlnet.load_state_dict(strip_module_prefix(checkpoint["controlnet_state_dict"]))
+    model.condition_adapter.load_state_dict(
+        strip_module_prefix(checkpoint["condition_adapter_state_dict"])
     )
+    if "optimizer_state_dict" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        move_optimizer_state_to_device(optimizer, device)
+
+    global_step = int(checkpoint.get("global_step", 0))
+    start_epoch = int(checkpoint.get("epoch", -1)) + 1
+    print(
+        f"Resumed training from {checkpoint_path}: "
+        f"start_epoch={start_epoch}, global_step={global_step}",
+        flush=True,
+    )
+    return start_epoch, global_step
+
+
+def move_optimizer_state_to_device(
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> None:
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if isinstance(value, torch.Tensor):
+                state[key] = value.to(device)
 
 
 def train(args: argparse.Namespace) -> None:
@@ -351,9 +412,9 @@ def train(args: argparse.Namespace) -> None:
         eps=1e-8,
     )
 
-    global_step = 0
+    start_epoch, global_step = load_resume_checkpoint(model, optimizer, device, args.resume)
     printed_shapes = False
-    for epoch in range(args.num_epochs):
+    for epoch in range(start_epoch, args.num_epochs):
         epoch_loss = 0.0
         for batch_index, batch in enumerate(dataloader):
             rgb = batch["rgb"].to(device, non_blocking=True)
@@ -415,8 +476,19 @@ def train(args: argparse.Namespace) -> None:
                     model=model,
                     optimizer=optimizer,
                     args=args,
-                    filename=f"step_{global_step:06d}.pth",
+                    filename="last.pth",
                 )
+                if args.save_total_limit != 0:
+                    save_checkpoint(
+                        save_dir=save_dir,
+                        epoch=epoch,
+                        global_step=global_step,
+                        model=model,
+                        optimizer=optimizer,
+                        args=args,
+                        filename=f"step_{global_step:06d}.pth",
+                    )
+                    prune_step_checkpoints(save_dir, args.save_total_limit)
 
         avg_loss = epoch_loss / max(len(dataloader), 1)
         print(
