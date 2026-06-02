@@ -14,14 +14,12 @@ from torch.utils.data import DataLoader, Subset
 from transformers import CLIPTextModel, CLIPTokenizer, PretrainedConfig
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-POLARANYTHING_ROOT = PROJECT_ROOT / "PolarAnything-main"
-for path in (PROJECT_ROOT, POLARANYTHING_ROOT):
-    if str(path) not in sys.path:
-        sys.path.insert(0, str(path))
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from datasets.stage2_residual_dataset import Stage2ResidualDataset  # noqa: E402
-from model.PolarControlnet import PolarControl  # noqa: E402
-from model.utils import load_params  # noqa: E402
+from models.PolarControlnet import PolarControl  # noqa: E402
+from models.utils import load_params  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
