@@ -68,6 +68,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vae_scaling_factor", type=float, default=0.18215)
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--vis_every", type=int, default=50)
+    parser.add_argument("--vae_encode_mode", choices=("mode", "sample"), default="mode")
+    parser.add_argument("--residual_scale", type=float, default=1.0)
+    parser.add_argument(
+        "--inference_mode",
+        choices=("stage2", "prior_vae", "gt_vae"),
+        default="stage2",
+    )
     return parser.parse_args()
 
 
@@ -167,14 +174,27 @@ def infer_batch(
     generator: torch.Generator,
     num_inference_steps: int,
     vae_scaling_factor: float,
+    vae_encode_mode: str,
+    residual_scale: float,
+    inference_mode: str,
 ) -> torch.Tensor:
     rgb = batch["rgb"].to(device, non_blocking=True)
     prior = batch["prior"].to(device, non_blocking=True)
     confidence = batch["confidence"].to(device, non_blocking=True)
 
     prior_vae = polar_to_vae_input(prior)
-    z_c = vae.encode(prior_vae).latent_dist.sample(generator=generator)
-    z_c = z_c * vae_scaling_factor
+    z_c = encode_latents(vae, prior_vae, generator, vae_encode_mode, vae_scaling_factor)
+
+    if inference_mode == "prior_vae":
+        decoded = vae.decode(z_c / vae_scaling_factor).sample
+        return postprocess_decoded_polar(decoded)
+
+    if inference_mode == "gt_vae":
+        polar_gt = batch["polar_gt"].to(device, non_blocking=True)
+        gt_vae = polar_to_vae_input(polar_gt)
+        z_gt = encode_latents(vae, gt_vae, generator, vae_encode_mode, vae_scaling_factor)
+        decoded = vae.decode(z_gt / vae_scaling_factor).sample
+        return postprocess_decoded_polar(decoded)
 
     delta_z = torch.randn(
         z_c.shape,
@@ -190,9 +210,26 @@ def infer_batch(
         noise_pred = model(delta_z, model_timestep, condition)
         delta_z = scheduler.step(noise_pred, timestep, delta_z).prev_sample
 
-    z_final = z_c + delta_z
+    z_final = z_c + residual_scale * delta_z
     decoded = vae.decode(z_final / vae_scaling_factor).sample
     return postprocess_decoded_polar(decoded)
+
+
+def encode_latents(
+    vae: AutoencoderKL,
+    vae_input: torch.Tensor,
+    generator: torch.Generator,
+    vae_encode_mode: str,
+    vae_scaling_factor: float,
+) -> torch.Tensor:
+    latent_dist = vae.encode(vae_input).latent_dist
+    if vae_encode_mode == "mode":
+        latents = latent_dist.mode()
+    elif vae_encode_mode == "sample":
+        latents = latent_dist.sample(generator=generator)
+    else:
+        raise ValueError(f"Unknown vae_encode_mode: {vae_encode_mode}")
+    return latents * vae_scaling_factor
 
 
 def postprocess_decoded_polar(decoded: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -354,6 +391,9 @@ def write_summary(
         f"pretrained_model_name_or_path: {args.pretrained_model_name_or_path}",
         f"image_size: {args.image_size}",
         f"num_inference_steps: {args.num_inference_steps}",
+        f"vae_encode_mode: {args.vae_encode_mode}",
+        f"residual_scale: {args.residual_scale}",
+        f"inference_mode: {args.inference_mode}",
         f"seed: {args.seed}",
         f"prompt: {args.prompt}",
         "",
@@ -401,6 +441,9 @@ def run(args: argparse.Namespace) -> None:
                 generator=generator,
                 num_inference_steps=args.num_inference_steps,
                 vae_scaling_factor=args.vae_scaling_factor,
+                vae_encode_mode=args.vae_encode_mode,
+                residual_scale=args.residual_scale,
+                inference_mode=args.inference_mode,
             ).cpu()
 
             names = batch["name"]
