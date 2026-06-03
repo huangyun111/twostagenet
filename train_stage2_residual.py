@@ -58,6 +58,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt", type=str, default="denoised polarized images")
     parser.add_argument("--vae_scaling_factor", type=float, default=0.18215)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--vae_encode_mode", choices=("mode", "sample"), default="mode")
+    parser.add_argument(
+        "--train_target",
+        choices=("all", "controlnet_adapter_only"),
+        default="all",
+    )
+    parser.add_argument("--val_root_dir", type=str, default=None)
+    parser.add_argument("--val_stage1_dir", type=str, default=None)
     return parser.parse_args()
 
 
@@ -154,6 +162,28 @@ def build_dataloader(args: argparse.Namespace) -> DataLoader:
     )
 
 
+def build_val_dataloader(args: argparse.Namespace) -> DataLoader | None:
+    val_root_dir = normalize_optional_path(args.val_root_dir)
+    val_stage1_dir = normalize_optional_path(args.val_stage1_dir)
+    if val_root_dir is None and val_stage1_dir is None:
+        return None
+    if val_root_dir is None or val_stage1_dir is None:
+        raise ValueError("val_root_dir and val_stage1_dir must be provided together.")
+
+    dataset = Stage2ResidualDataset(
+        root_dir=val_root_dir,
+        stage1_dir=val_stage1_dir,
+        image_size=args.image_size,
+    )
+    return DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+
 def build_models(
     args: argparse.Namespace,
     device: torch.device,
@@ -185,6 +215,23 @@ def build_models(
     vae.to(device)
     model.to(device)
     return vae, noise_scheduler, model
+
+
+def configure_train_target(
+    model: Stage2ResidualDiffusionModel,
+    train_target: str,
+) -> None:
+    model.text_encoder.requires_grad_(False)
+    if train_target == "all":
+        model.unet.requires_grad_(True)
+        model.controlnet.requires_grad_(True)
+        model.condition_adapter.requires_grad_(True)
+    elif train_target == "controlnet_adapter_only":
+        model.unet.requires_grad_(False)
+        model.controlnet.requires_grad_(True)
+        model.condition_adapter.requires_grad_(True)
+    else:
+        raise ValueError(f"Unknown train_target: {train_target}")
 
 
 def resolve_pretrained_model_path(model_name_or_path: str) -> str:
@@ -295,16 +342,33 @@ def compute_residual_latents(
     polar_gt: torch.Tensor,
     prior: torch.Tensor,
     vae_scaling_factor: float,
+    vae_encode_mode: str = "mode",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     polar_gt_vae = polar_to_vae_input(polar_gt)
     prior_vae = polar_to_vae_input(prior)
 
     with torch.no_grad():
-        z_gt = vae.encode(polar_gt_vae).latent_dist.sample() * vae_scaling_factor
-        z_c = vae.encode(prior_vae).latent_dist.sample() * vae_scaling_factor
+        z_gt = encode_vae_latents(vae, polar_gt_vae, vae_encode_mode, vae_scaling_factor)
+        z_c = encode_vae_latents(vae, prior_vae, vae_encode_mode, vae_scaling_factor)
 
     delta_z = z_gt - z_c
     return z_gt, z_c, delta_z
+
+
+def encode_vae_latents(
+    vae: AutoencoderKL,
+    vae_input: torch.Tensor,
+    vae_encode_mode: str,
+    vae_scaling_factor: float,
+) -> torch.Tensor:
+    latent_dist = vae.encode(vae_input).latent_dist
+    if vae_encode_mode == "mode":
+        latents = latent_dist.mode()
+    elif vae_encode_mode == "sample":
+        latents = latent_dist.sample()
+    else:
+        raise ValueError(f"Unknown vae_encode_mode: {vae_encode_mode}")
+    return latents * vae_scaling_factor
 
 
 def print_shape_summary(
@@ -394,13 +458,82 @@ def move_optimizer_state_to_device(
                 state[key] = value.to(device)
 
 
+def compute_noise_prediction_loss(
+    batch: dict[str, torch.Tensor | list[str]],
+    vae: AutoencoderKL,
+    noise_scheduler: DDPMScheduler,
+    model: Stage2ResidualDiffusionModel,
+    device: torch.device,
+    vae_scaling_factor: float,
+    vae_encode_mode: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    rgb = batch["rgb"].to(device, non_blocking=True)
+    polar_gt = batch["polar_gt"].to(device, non_blocking=True)
+    prior = batch["prior"].to(device, non_blocking=True)
+    confidence = batch["confidence"].to(device, non_blocking=True)
+
+    _, _, delta_z = compute_residual_latents(
+        vae=vae,
+        polar_gt=polar_gt,
+        prior=prior,
+        vae_scaling_factor=vae_scaling_factor,
+        vae_encode_mode=vae_encode_mode,
+    )
+
+    noise = torch.randn_like(delta_z)
+    timesteps = torch.randint(
+        0,
+        noise_scheduler.config.num_train_timesteps,
+        (delta_z.shape[0],),
+        device=device,
+    ).long()
+    noisy_delta_z = noise_scheduler.add_noise(delta_z, noise, timesteps)
+
+    condition = torch.cat([rgb, prior, confidence], dim=1)
+    noise_pred = model(noisy_delta_z, timesteps, condition)
+    loss = F.mse_loss(noise_pred.float(), noise.float())
+    return loss, delta_z, noisy_delta_z
+
+
+def evaluate(
+    dataloader: DataLoader,
+    vae: AutoencoderKL,
+    noise_scheduler: DDPMScheduler,
+    model: Stage2ResidualDiffusionModel,
+    device: torch.device,
+    vae_scaling_factor: float,
+    vae_encode_mode: str,
+) -> float:
+    was_training = model.training
+    model.eval()
+    total_loss = 0.0
+    with torch.no_grad():
+        for batch in dataloader:
+            loss, _, _ = compute_noise_prediction_loss(
+                batch=batch,
+                vae=vae,
+                noise_scheduler=noise_scheduler,
+                model=model,
+                device=device,
+                vae_scaling_factor=vae_scaling_factor,
+                vae_encode_mode=vae_encode_mode,
+            )
+            total_loss += float(loss.detach())
+    if was_training:
+        model.train()
+        model.text_encoder.eval()
+    return total_loss / max(len(dataloader), 1)
+
+
 def train(args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed)
     device = resolve_device(args.device)
     save_dir = Path(args.save_dir)
 
     dataloader = build_dataloader(args)
+    val_dataloader = build_val_dataloader(args)
     vae, noise_scheduler, model = build_models(args, device)
+    configure_train_target(model, args.train_target)
     model.train()
     model.text_encoder.eval()
 
@@ -414,39 +547,29 @@ def train(args: argparse.Namespace) -> None:
 
     start_epoch, global_step = load_resume_checkpoint(model, optimizer, device, args.resume)
     printed_shapes = False
+    best_val_loss = float("inf")
     for epoch in range(start_epoch, args.num_epochs):
         epoch_loss = 0.0
         for batch_index, batch in enumerate(dataloader):
-            rgb = batch["rgb"].to(device, non_blocking=True)
-            polar_gt = batch["polar_gt"].to(device, non_blocking=True)
-            prior = batch["prior"].to(device, non_blocking=True)
-            confidence = batch["confidence"].to(device, non_blocking=True)
-
-            _, _, delta_z = compute_residual_latents(
+            loss, delta_z, noisy_delta_z = compute_noise_prediction_loss(
+                batch=batch,
                 vae=vae,
-                polar_gt=polar_gt,
-                prior=prior,
-                vae_scaling_factor=args.vae_scaling_factor,
-            )
-
-            noise = torch.randn_like(delta_z)
-            timesteps = torch.randint(
-                0,
-                noise_scheduler.config.num_train_timesteps,
-                (delta_z.shape[0],),
+                noise_scheduler=noise_scheduler,
+                model=model,
                 device=device,
-            ).long()
-            noisy_delta_z = noise_scheduler.add_noise(delta_z, noise, timesteps)
-
-            condition = torch.cat([rgb, prior, confidence], dim=1)
-            noise_pred = model(noisy_delta_z, timesteps, condition)
-            loss = F.mse_loss(noise_pred.float(), noise.float())
+                vae_scaling_factor=args.vae_scaling_factor,
+                vae_encode_mode=args.vae_encode_mode,
+            )
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
 
             if not printed_shapes:
+                rgb = batch["rgb"].to(device, non_blocking=True)
+                polar_gt = batch["polar_gt"].to(device, non_blocking=True)
+                prior = batch["prior"].to(device, non_blocking=True)
+                confidence = batch["confidence"].to(device, non_blocking=True)
                 shape_batch = {
                     "rgb": rgb,
                     "polar_gt": polar_gt,
@@ -491,10 +614,41 @@ def train(args: argparse.Namespace) -> None:
                     prune_step_checkpoints(save_dir, args.save_total_limit)
 
         avg_loss = epoch_loss / max(len(dataloader), 1)
-        print(
-            f"epoch {epoch + 1}/{args.num_epochs} complete avg_loss {avg_loss:.6f}",
-            flush=True,
-        )
+        val_avg_loss = None
+        if val_dataloader is not None:
+            val_avg_loss = evaluate(
+                dataloader=val_dataloader,
+                vae=vae,
+                noise_scheduler=noise_scheduler,
+                model=model,
+                device=device,
+                vae_scaling_factor=args.vae_scaling_factor,
+                vae_encode_mode=args.vae_encode_mode,
+            )
+            if val_avg_loss < best_val_loss:
+                best_val_loss = val_avg_loss
+                save_checkpoint(
+                    save_dir=save_dir,
+                    epoch=epoch,
+                    global_step=global_step,
+                    model=model,
+                    optimizer=optimizer,
+                    args=args,
+                    filename="best_val.pth",
+                )
+        if val_avg_loss is not None:
+            print(
+                f"epoch {epoch + 1}/{args.num_epochs} "
+                f"train_avg_loss {avg_loss:.6f} "
+                f"val_avg_loss {val_avg_loss:.6f}",
+                flush=True,
+            )
+        else:
+            print(
+                f"epoch {epoch + 1}/{args.num_epochs} "
+                f"train_avg_loss {avg_loss:.6f}",
+                flush=True,
+            )
 
     save_checkpoint(
         save_dir=save_dir,
