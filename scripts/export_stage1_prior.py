@@ -30,6 +30,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--output_dir", type=str, default="./stage1_exports")
     parser.add_argument("--image_size", type=int, default=256)
+    parser.add_argument(
+        "--preprocess_mode",
+        choices=("resize256", "official_infer"),
+        default="resize256",
+    )
+    parser.add_argument(
+        "--output_size_mode",
+        choices=("fixed", "native"),
+        default="fixed",
+    )
+    parser.add_argument("--divisible_by", type=int, default=32)
+    parser.add_argument(
+        "--normalize_mode",
+        choices=("fixed255", "image_max"),
+        default="fixed255",
+    )
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--encoder_weights", type=str, default=None)
@@ -50,6 +66,40 @@ def resolve_device(device_arg: str) -> torch.device:
     if device_arg == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(device_arg)
+
+
+def format_size_set(values: set[str]) -> str:
+    if not values:
+        return "unknown"
+    ordered = sorted(values)
+    if len(ordered) <= 8:
+        return ", ".join(ordered)
+    return ", ".join(ordered[:8]) + f", ... ({len(ordered)} unique)"
+
+
+def write_summary(
+    path: Path,
+    args: argparse.Namespace,
+    exported: int,
+    input_native_sizes: set[str],
+    input_sizes: set[str],
+) -> None:
+    lines = [
+        "Stage 1 prior export summary",
+        f"root_dir: {args.root_dir}",
+        f"checkpoint: {args.checkpoint}",
+        f"output_dir: {args.output_dir}",
+        f"samples: {exported}",
+        f"preprocess_mode: {args.preprocess_mode}",
+        f"normalize_mode: {args.normalize_mode}",
+        f"output_size_mode: {args.output_size_mode}",
+        f"divisible_by: {args.divisible_by}",
+        f"input_native_size: {format_size_set(input_native_sizes)}",
+        f"input_size: {format_size_set(input_sizes)}",
+        "prior_format: [DoLP, cos(2AoLP), sin(2AoLP)]",
+        "confidence_format: [3,H,W] in [0,1]",
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def load_model(args: argparse.Namespace, device: torch.device) -> PolarPriorNet:
@@ -147,6 +197,10 @@ def export_batch(
 
 def main() -> None:
     args = parse_args()
+    if args.preprocess_mode == "official_infer" and args.batch_size != 1:
+        raise ValueError("official_infer keeps native sizes; use --batch_size 1.")
+    if args.preprocess_mode == "official_infer" and args.output_size_mode != "native":
+        raise ValueError("official_infer expects --output_size_mode native.")
     device = resolve_device(args.device)
 
     output_dir = Path(args.output_dir)
@@ -159,7 +213,10 @@ def main() -> None:
 
     dataset = Stage1PriorDataset(
         root_dir=args.root_dir,
-        image_size=args.image_size,
+        image_size=args.image_size if args.output_size_mode == "fixed" else None,
+        preprocess_mode=args.preprocess_mode,
+        normalize_mode=args.normalize_mode,
+        divisible_by=args.divisible_by,
         augment=False,
         return_path=False,
     )
@@ -173,7 +230,11 @@ def main() -> None:
     model = load_model(args, device)
 
     exported = 0
+    input_native_sizes: set[str] = set()
+    input_sizes: set[str] = set()
     for batch in dataloader:
+        input_native_sizes.update(str(value) for value in batch["input_native_size"])
+        input_sizes.update(str(value) for value in batch["input_size"])
         exported += export_batch(
             batch=batch,
             model=model,
@@ -186,6 +247,13 @@ def main() -> None:
         )
         print(f"exported {exported}/{len(dataset)}", flush=True)
 
+    write_summary(
+        output_dir / "summary.txt",
+        args,
+        exported,
+        input_native_sizes,
+        input_sizes,
+    )
     print(f"Done. Exported {exported} samples to {output_dir}")
 
 

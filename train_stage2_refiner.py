@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import random
 import sys
 from pathlib import Path
@@ -49,6 +50,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val_stage1_dir", type=str, default=None)
     parser.add_argument("--save_dir", type=str, default="./checkpoints_stage2_refiner")
     parser.add_argument("--image_size", type=int, default=256)
+    parser.add_argument(
+        "--preprocess_mode",
+        choices=("resize256", "official_train"),
+        default="resize256",
+    )
+    parser.add_argument("--crop_size", type=int, default=512)
+    parser.add_argument(
+        "--normalize_mode",
+        choices=("fixed255", "image_max"),
+        default="fixed255",
+    )
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -94,6 +106,10 @@ def build_dataloader(
     root_dir: str,
     stage1_dir: str,
     image_size: int,
+    preprocess_mode: str,
+    crop_size: int,
+    normalize_mode: str,
+    random_crop: bool,
     batch_size: int,
     num_workers: int,
     shuffle: bool,
@@ -104,6 +120,10 @@ def build_dataloader(
         root_dir=root_dir,
         stage1_dir=stage1_dir,
         image_size=image_size,
+        preprocess_mode=preprocess_mode,
+        crop_size=crop_size,
+        normalize_mode=normalize_mode,
+        random_crop=random_crop,
     )
     if max_samples is not None:
         if max_samples <= 0:
@@ -130,6 +150,10 @@ def build_val_dataloader(args: argparse.Namespace, device: torch.device) -> tupl
         root_dir=val_root_dir,
         stage1_dir=val_stage1_dir,
         image_size=args.image_size,
+        preprocess_mode=args.preprocess_mode,
+        crop_size=args.crop_size,
+        normalize_mode=args.normalize_mode,
+        random_crop=False,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         shuffle=False,
@@ -210,6 +234,20 @@ def append_log(log_path: Path, message: str) -> None:
     print(message, flush=True)
     with log_path.open("a", encoding="utf-8") as file:
         file.write(message + "\n")
+
+
+def write_config(path: Path, args: argparse.Namespace) -> None:
+    payload = {
+        **vars(args),
+        "crop_strategy": (
+            "official_train crops RGB/GT/prior/confidence to their common size, "
+            "resizes the short side to crop_size only when needed, then applies "
+            "train random crop or validation center crop."
+            if args.preprocess_mode == "official_train"
+            else "resize256 uses image_size fixed resize."
+        ),
+    }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def move_batch_to_device(
@@ -380,11 +418,16 @@ def main() -> None:
     save_dir.mkdir(parents=True, exist_ok=True)
     vis_dir.mkdir(parents=True, exist_ok=True)
     log_path = save_dir / "train_log.txt"
+    write_config(save_dir / "config.json", args)
 
     train_loader, train_size = build_dataloader(
         root_dir=args.root_dir,
         stage1_dir=args.stage1_dir,
         image_size=args.image_size,
+        preprocess_mode=args.preprocess_mode,
+        crop_size=args.crop_size,
+        normalize_mode=args.normalize_mode,
+        random_crop=args.preprocess_mode == "official_train",
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         shuffle=True,
@@ -417,7 +460,11 @@ def main() -> None:
         f"Start Stage2 refiner training on {device}, train_samples={train_size}, "
         f"val_samples={val_size}, batch_size={args.batch_size}, "
         f"base_channels={args.base_channels}, residual_scale={args.residual_scale}, "
-        f"min_gate={args.min_gate}",
+        f"min_gate={args.min_gate}, preprocess_mode={args.preprocess_mode}, "
+        f"crop_size={args.crop_size}, normalize_mode={args.normalize_mode}, "
+        f"root_dir={args.root_dir}, stage1_dir={args.stage1_dir}, "
+        f"val_root_dir={args.val_root_dir}, val_stage1_dir={args.val_stage1_dir}, "
+        f"num_epochs={args.num_epochs}, lr={args.lr}, weight_decay={args.weight_decay}",
     )
 
     for epoch in range(start_epoch, args.num_epochs + 1):

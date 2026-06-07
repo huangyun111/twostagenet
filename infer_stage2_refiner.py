@@ -44,6 +44,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--output_dir", type=str, default="./stage2_refiner_outputs")
     parser.add_argument("--image_size", type=int, default=256)
+    parser.add_argument(
+        "--preprocess_mode",
+        choices=("resize256", "official_infer"),
+        default="resize256",
+    )
+    parser.add_argument("--divisible_by", type=int, default=32)
+    parser.add_argument(
+        "--normalize_mode",
+        choices=("fixed255", "image_max"),
+        default="fixed255",
+    )
+    parser.add_argument("--resize_output_to_gt", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--device", type=str, default="auto")
@@ -66,6 +78,9 @@ def build_dataloader(args: argparse.Namespace, device: torch.device) -> tuple[Da
         root_dir=args.root_dir,
         stage1_dir=args.stage1_dir,
         image_size=args.image_size,
+        preprocess_mode=args.preprocess_mode,
+        normalize_mode=args.normalize_mode,
+        divisible_by=args.divisible_by,
     )
     if args.max_samples is not None:
         if args.max_samples <= 0:
@@ -124,6 +139,30 @@ def compute_metric_dict(pred: torch.Tensor, gt: torch.Tensor) -> dict[str, float
         "weighted_aolp_error_deg": weighted_mean(aolp_error_deg, weights),
         "high_dolp_aolp_error_deg": masked_mean(aolp_error_deg, high_mask),
     }
+
+
+def resize_polar_to_gt_if_requested(
+    tensor: torch.Tensor,
+    gt: torch.Tensor,
+    resize_output_to_gt: bool,
+) -> tuple[torch.Tensor, bool]:
+    if tensor.shape[-2:] == gt.shape[-2:]:
+        return tensor, False
+    if not resize_output_to_gt:
+        raise ValueError(
+            "Prediction/prior and GT sizes differ. Use --resize_output_to_gt "
+            f"for metrics. pred={tuple(tensor.shape[-2:])}, gt={tuple(gt.shape[-2:])}"
+        )
+    resized = torch.nn.functional.interpolate(
+        tensor.unsqueeze(0),
+        size=gt.shape[-2:],
+        mode="bilinear",
+        align_corners=False,
+    ).squeeze(0)
+    dolp = resized[0:1].clamp(0.0, 1.0)
+    cos_sin = resized[1:3].clamp(-1.0, 1.0)
+    norm = torch.sqrt((cos_sin * cos_sin).sum(dim=0, keepdim=True) + 1e-6)
+    return torch.cat((dolp, cos_sin / norm), dim=0).contiguous(), True
 
 
 def compute_aolp_error_deg(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
@@ -249,6 +288,9 @@ def write_summary(
     args: argparse.Namespace,
     sample_count: int,
     summary: dict[str, float],
+    input_native_sizes: set[str],
+    input_sizes: set[str],
+    output_resized_count: int,
 ) -> None:
     lines = [
         "Stage 2 confidence-guided residual refiner test summary",
@@ -256,6 +298,13 @@ def write_summary(
         f"root_dir: {args.root_dir}",
         f"stage1_dir: {args.stage1_dir}",
         f"checkpoint: {args.checkpoint}",
+        f"preprocess_mode: {args.preprocess_mode}",
+        f"normalize_mode: {args.normalize_mode}",
+        f"input_native_size: {format_size_set(input_native_sizes)}",
+        f"input_size: {format_size_set(input_sizes)}",
+        f"divisible_by: {args.divisible_by}",
+        f"resize_output_to_gt: {args.resize_output_to_gt}",
+        f"output_resized_to_gt_count: {output_resized_count}",
         f"residual_scale: {args.residual_scale}",
         f"min_gate: {args.min_gate}",
         f"base_channels: {args.base_channels}",
@@ -268,6 +317,15 @@ def write_summary(
     summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def format_size_set(values: set[str]) -> str:
+    if not values:
+        return "unknown"
+    ordered = sorted(values)
+    if len(ordered) <= 8:
+        return ", ".join(ordered)
+    return ", ".join(ordered[:8]) + f", ... ({len(ordered)} unique)"
+
+
 def format_float(value: float) -> str:
     if math.isnan(value):
         return "nan"
@@ -275,6 +333,8 @@ def format_float(value: float) -> str:
 
 
 def run(args: argparse.Namespace) -> None:
+    if args.preprocess_mode == "official_infer" and args.batch_size != 1:
+        raise ValueError("official_infer keeps native sizes; use --batch_size 1.")
     device = resolve_device(args.device)
     output_dir = Path(args.output_dir)
     refined_dir = output_dir / "refined_npy"
@@ -287,8 +347,13 @@ def run(args: argparse.Namespace) -> None:
 
     rows: list[dict[str, float | str]] = []
     processed = 0
+    output_resized_count = 0
+    input_native_sizes: set[str] = set()
+    input_sizes: set[str] = set()
     with torch.no_grad():
         for batch in dataloader:
+            input_native_sizes.update(str(value) for value in batch["input_native_size"])
+            input_sizes.update(str(value) for value in batch["input_size"])
             rgb = batch["rgb"].to(device, non_blocking=True)
             prior = batch["prior"].to(device, non_blocking=True)
             confidence = batch["confidence"].to(device, non_blocking=True)
@@ -304,22 +369,36 @@ def run(args: argparse.Namespace) -> None:
             for offset, name in enumerate(names):
                 sample_index = processed + offset
                 sample_refined = pred_cpu["refined"][offset]
+                sample_prior = prior_cpu[offset]
+                sample_gt = polar_gt_cpu[offset]
                 np.save(
                     refined_dir / f"{name}.npy",
                     sample_refined.numpy().astype(np.float32),
                 )
+                prior_eval, prior_resized = resize_polar_to_gt_if_requested(
+                    sample_prior,
+                    sample_gt,
+                    args.resize_output_to_gt,
+                )
+                refined_eval, refined_resized = resize_polar_to_gt_if_requested(
+                    sample_refined,
+                    sample_gt,
+                    args.resize_output_to_gt,
+                )
+                if prior_resized or refined_resized:
+                    output_resized_count += 1
 
                 row: dict[str, float | str] = {"name": name}
                 row.update(
                     prefix_metrics(
                         "stage1",
-                        compute_metric_dict(prior_cpu[offset], polar_gt_cpu[offset]),
+                        compute_metric_dict(prior_eval, sample_gt),
                     )
                 )
                 row.update(
                     prefix_metrics(
                         "stage2",
-                        compute_metric_dict(sample_refined, polar_gt_cpu[offset]),
+                        compute_metric_dict(refined_eval, sample_gt),
                     )
                 )
                 rows.append(row)
@@ -327,10 +406,13 @@ def run(args: argparse.Namespace) -> None:
                 if args.vis_every > 0 and sample_index % args.vis_every == 0:
                     save_visualization(
                         rgb=rgb_cpu[offset],
-                        polar_gt=polar_gt_cpu[offset],
-                        prior=prior_cpu[offset],
+                        polar_gt=sample_gt,
+                        prior=prior_eval,
                         confidence=confidence_cpu[offset],
-                        pred_dict={key: value[offset] for key, value in pred_cpu.items()},
+                        pred_dict={
+                            **{key: value[offset] for key, value in pred_cpu.items()},
+                            "refined": refined_eval,
+                        },
                         path=vis_dir / f"{name}.png",
                     )
 
@@ -339,7 +421,15 @@ def run(args: argparse.Namespace) -> None:
 
     write_metrics_csv(output_dir / "metrics.csv", rows)
     summary = summarize_rows(rows)
-    write_summary(output_dir / "summary.txt", args, len(rows), summary)
+    write_summary(
+        output_dir / "summary.txt",
+        args,
+        len(rows),
+        summary,
+        input_native_sizes,
+        input_sizes,
+        output_resized_count,
+    )
     print(f"Done. Wrote outputs to {output_dir}", flush=True)
 
 

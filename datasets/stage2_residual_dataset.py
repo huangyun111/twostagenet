@@ -4,11 +4,22 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import imageio.v3 as iio
 import numpy as np
 import torch
-from PIL import Image
 from torch.utils.data import Dataset
+
+from datasets.official_preprocess import (
+    clamp_polar,
+    crop_tensors,
+    crop_to_common_size,
+    format_hw,
+    read_polar_encoding,
+    read_rgb_image,
+    resize_confidence_hw,
+    resize_polar_hw,
+    resize_rgb_hw,
+    resize_short_side_if_needed,
+)
 
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
@@ -17,8 +28,9 @@ IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
 class Stage2ResidualDataset(Dataset):
     """Load RGB, GT polarization, Stage 1 prior, and confidence tensors.
 
-    Polarization_Encoding is read with imageio/PIL-style RGB ordering, not cv2.
-    In RGB order the channels are [DoLP, cos2AoLP, sin2AoLP].
+    GT and prior use physical [DoLP, cos2AoLP, sin2AoLP]. official_train
+    synchronizes RGB/GT/prior/confidence crops; official_infer keeps GT native
+    and deterministically crops RGB/prior/confidence to a common legal size.
     """
 
     def __init__(
@@ -30,6 +42,11 @@ class Stage2ResidualDataset(Dataset):
         prior_subdir: str = "prior_npy",
         confidence_subdir: str = "confidence_npy",
         image_size: int | None = None,
+        preprocess_mode: str = "resize256",
+        crop_size: int = 512,
+        normalize_mode: str = "fixed255",
+        divisible_by: int = 32,
+        random_crop: bool = False,
         return_path: bool = False,
     ) -> None:
         self.root_dir = Path(root_dir)
@@ -39,10 +56,23 @@ class Stage2ResidualDataset(Dataset):
         self.prior_dir = self._resolve_subdir(self.stage1_dir, prior_subdir)
         self.confidence_dir = self._resolve_subdir(self.stage1_dir, confidence_subdir)
         self.image_size = image_size
+        self.preprocess_mode = preprocess_mode
+        self.crop_size = crop_size
+        self.normalize_mode = normalize_mode
+        self.divisible_by = divisible_by
+        self.random_crop = random_crop
         self.return_path = return_path
 
         if image_size is not None and image_size <= 0:
             raise ValueError("image_size must be positive or None.")
+        if preprocess_mode not in {"resize256", "official_train", "official_infer"}:
+            raise ValueError(f"Unsupported preprocess_mode: {preprocess_mode}")
+        if crop_size <= 0:
+            raise ValueError("crop_size must be positive.")
+        if normalize_mode not in {"fixed255", "image_max"}:
+            raise ValueError(f"Unsupported normalize_mode: {normalize_mode}")
+        if divisible_by <= 0:
+            raise ValueError("divisible_by must be positive.")
 
         self.samples = self._collect_samples()
         if not self.samples:
@@ -58,16 +88,56 @@ class Stage2ResidualDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
         rgb_path, polar_path, prior_path, confidence_path, stem = self.samples[index]
 
-        rgb = self._read_rgb(rgb_path)
+        rgb = read_rgb_image(rgb_path, normalize_mode=self.normalize_mode)
         polar_gt = self._read_polar(polar_path)
         prior = self._read_prior(prior_path)
         confidence = self._read_confidence(confidence_path)
+        input_native_size = format_hw(rgb)
 
-        if self.image_size is not None:
+        if self.preprocess_mode == "resize256" and self.image_size is not None:
             rgb = self._resize_rgb(rgb, self.image_size)
             polar_gt = self._resize_polar(polar_gt, self.image_size)
             prior = self._resize_polar(prior, self.image_size)
             confidence = self._resize_map(confidence, self.image_size).clamp(0.0, 1.0)
+        elif self.preprocess_mode == "official_train":
+            rgb, polar_gt, prior, confidence = crop_to_common_size(
+                [rgb, polar_gt, prior, confidence]
+            )
+            rgb, polar_gt, prior, confidence = resize_short_side_if_needed(
+                [rgb, polar_gt, prior, confidence],
+                self.crop_size,
+                ["rgb", "polar", "polar", "confidence"],
+            )
+            import random
+
+            rgb, polar_gt, prior, confidence = crop_tensors(
+                [rgb, polar_gt, prior, confidence],
+                self.crop_size,
+                self.crop_size,
+                random_crop=self.random_crop,
+                rng=random.Random(index),
+            )
+        elif self.preprocess_mode == "official_infer":
+            rgb, prior, confidence = crop_to_common_size([rgb, prior, confidence])
+            height, width = rgb.shape[-2:]
+            target_height = (height // self.divisible_by) * self.divisible_by
+            target_width = (width // self.divisible_by) * self.divisible_by
+            if target_height <= 0 or target_width <= 0:
+                raise ValueError(
+                    f"Input is too small for divisible_by={self.divisible_by}: {height}x{width}"
+                )
+            rgb, prior, confidence = crop_tensors(
+                [rgb, prior, confidence],
+                target_height,
+                target_width,
+                random_crop=False,
+                rng=__import__("random").Random(0),
+            )
+
+        polar_gt = self._clamp_polar(polar_gt)
+        prior = self._clamp_polar(prior)
+        confidence = confidence.clamp(0.0, 1.0)
+        input_size = format_hw(rgb)
 
         item: dict[str, torch.Tensor | str] = {
             "rgb": rgb,
@@ -75,6 +145,8 @@ class Stage2ResidualDataset(Dataset):
             "prior": prior,
             "confidence": confidence,
             "name": stem,
+            "input_native_size": input_native_size,
+            "input_size": input_size,
         }
         if self.return_path:
             item["rgb_path"] = str(rgb_path)
@@ -136,28 +208,11 @@ class Stage2ResidualDataset(Dataset):
 
     @staticmethod
     def _read_rgb(path: Path) -> torch.Tensor:
-        image = Image.open(path).convert("RGB")
-        array = np.asarray(image, dtype=np.float32) / 255.0
-        array = array * 2.0 - 1.0
-        return torch.from_numpy(array).permute(2, 0, 1).contiguous()
+        return read_rgb_image(path, normalize_mode="fixed255")
 
     @classmethod
     def _read_polar(cls, path: Path) -> torch.Tensor:
-        encoded = iio.imread(path)
-        if encoded.ndim == 2:
-            raise ValueError(f"Expected 3-channel Polarization_Encoding image: {path}")
-        if encoded.shape[-1] < 3:
-            raise ValueError(f"Expected at least 3 channels in Polarization_Encoding: {path}")
-
-        encoded = encoded[..., :3]
-        encoded_float = cls._to_unit_range(encoded)
-
-        dolp = encoded_float[..., 0]
-        cos2 = encoded_float[..., 1] * 2.0 - 1.0
-        sin2 = encoded_float[..., 2] * 2.0 - 1.0
-
-        polar = np.stack((dolp, cos2, sin2), axis=0).astype(np.float32)
-        return cls._clamp_polar(torch.from_numpy(polar))
+        return read_polar_encoding(path)
 
     @staticmethod
     def _to_unit_range(array: np.ndarray) -> np.ndarray:
@@ -203,30 +258,16 @@ class Stage2ResidualDataset(Dataset):
 
     @staticmethod
     def _resize_rgb(rgb: torch.Tensor, image_size: int) -> torch.Tensor:
-        array = rgb.permute(1, 2, 0).numpy()
-        array = ((array + 1.0) * 0.5 * 255.0).clip(0.0, 255.0).astype(np.uint8)
-        image = Image.fromarray(array, mode="RGB")
-        image = image.resize((image_size, image_size), Image.BILINEAR)
-        resized = np.asarray(image, dtype=np.float32) / 255.0
-        resized = resized * 2.0 - 1.0
-        return torch.from_numpy(resized).permute(2, 0, 1).contiguous()
+        return resize_rgb_hw(rgb, image_size, image_size)
 
     @classmethod
     def _resize_polar(cls, polar: torch.Tensor, image_size: int) -> torch.Tensor:
-        resized = cls._resize_map(polar, image_size)
-        return cls._clamp_polar(resized)
+        return resize_polar_hw(polar, image_size, image_size)
 
     @staticmethod
     def _resize_map(tensor: torch.Tensor, image_size: int) -> torch.Tensor:
-        channels = []
-        for channel in tensor:
-            image = Image.fromarray(channel.numpy().astype(np.float32), mode="F")
-            image = image.resize((image_size, image_size), Image.BILINEAR)
-            channels.append(np.asarray(image, dtype=np.float32))
-        return torch.from_numpy(np.stack(channels, axis=0)).contiguous()
+        return resize_confidence_hw(tensor, image_size, image_size)
 
     @staticmethod
     def _clamp_polar(polar: torch.Tensor) -> torch.Tensor:
-        dolp = polar[0:1].clamp(0.0, 1.0)
-        cos_sin = polar[1:3].clamp(-1.0, 1.0)
-        return torch.cat((dolp, cos_sin), dim=0).contiguous()
+        return clamp_polar(polar)

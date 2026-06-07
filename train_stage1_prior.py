@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import random
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--save_dir", type=str, default="./checkpoints_stage1_prior")
     parser.add_argument("--image_size", type=int, default=256)
+    parser.add_argument(
+        "--preprocess_mode",
+        choices=("resize256", "official_train"),
+        default="resize256",
+    )
+    parser.add_argument("--crop_size", type=int, default=512)
+    parser.add_argument(
+        "--normalize_mode",
+        choices=("fixed255", "image_max"),
+        default="fixed255",
+    )
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -126,6 +138,20 @@ def append_log(log_path: Path, message: str) -> None:
     print(message)
     with log_path.open("a", encoding="utf-8") as file:
         file.write(message + "\n")
+
+
+def write_config(path: Path, args: argparse.Namespace) -> None:
+    payload = {
+        **vars(args),
+        "crop_strategy": (
+            "official_train resizes the short side to crop_size only when needed, "
+            "then random-crops train samples to crop_size."
+            if args.preprocess_mode == "official_train"
+            else "resize256 uses image_size fixed resize."
+        ),
+        "target_format": "[DoLP, cos(2AoLP), sin(2AoLP)] with DoLP in [0,1]",
+    }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def tensor_to_numpy_image(rgb: torch.Tensor) -> np.ndarray:
@@ -251,12 +277,17 @@ def main() -> None:
     save_dir.mkdir(parents=True, exist_ok=True)
     vis_dir.mkdir(parents=True, exist_ok=True)
     log_path = save_dir / "train_log.txt"
+    write_config(save_dir / "config.json", args)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     dataset = Stage1PriorDataset(
         root_dir=args.root_dir,
         image_size=args.image_size,
+        preprocess_mode=args.preprocess_mode,
+        crop_size=args.crop_size,
+        normalize_mode=args.normalize_mode,
+        random_crop=args.preprocess_mode == "official_train",
     )
     dataloader = DataLoader(
         dataset,
@@ -278,7 +309,11 @@ def main() -> None:
     append_log(
         log_path,
         f"Start training on {device}, samples={len(dataset)}, "
-        f"batch_size={args.batch_size}, lrs={format_lrs(optimizer)}",
+        f"batch_size={args.batch_size}, lrs={format_lrs(optimizer)}, "
+        f"preprocess_mode={args.preprocess_mode}, crop_size={args.crop_size}, "
+        f"normalize_mode={args.normalize_mode}, root_dir={args.root_dir}, "
+        f"num_epochs={args.num_epochs}, lr={args.lr}, encoder_lr={args.encoder_lr}, "
+        f"encoder_weights={args.encoder_weights}",
     )
 
     for epoch in range(start_epoch, args.num_epochs + 1):
