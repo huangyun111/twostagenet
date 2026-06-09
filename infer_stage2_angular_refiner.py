@@ -220,6 +220,20 @@ def polar_to_aolp(polar: torch.Tensor) -> torch.Tensor:
     return 0.5 * torch.atan2(polar[2], polar[1])
 
 
+def polar_to_aolp_deg(polar: torch.Tensor | np.ndarray) -> np.ndarray:
+    array = polar.detach().float().cpu().numpy() if isinstance(polar, torch.Tensor) else np.asarray(polar)
+    if array.ndim != 3:
+        raise ValueError(f"Expected polar shape [3,H,W] or [H,W,3], got {array.shape}.")
+    if array.shape[0] == 3:
+        polar_chw = array
+    elif array.shape[-1] == 3:
+        polar_chw = np.moveaxis(array, -1, 0)
+    else:
+        raise ValueError(f"Expected polar shape [3,H,W] or [H,W,3], got {array.shape}.")
+    aolp_rad = 0.5 * np.arctan2(polar_chw[2], polar_chw[1])
+    return np.clip(aolp_rad * (180.0 / math.pi), -90.0, 90.0)
+
+
 def aolp_to_display(aolp: torch.Tensor) -> np.ndarray:
     return np.clip(((aolp.detach().cpu().numpy() + math.pi / 2.0) / math.pi), 0.0, 1.0)
 
@@ -245,6 +259,53 @@ def save_polar_encoding_png(polar: torch.Tensor, path: Path) -> None:
     bgr_u16 = rgb_u16[..., ::-1]
     if not cv2.imwrite(str(path), bgr_u16):
         raise IOError(f"Failed to write encoding PNG: {path}")
+
+
+def save_paper_aop_dop_vis(
+    rgb_or_none: torch.Tensor | np.ndarray | None,
+    gt_polar: torch.Tensor | np.ndarray,
+    pred_polar: torch.Tensor | np.ndarray,
+    save_path: Path,
+) -> None:
+    del rgb_or_none
+    gt_array = gt_polar.detach().float().cpu().numpy() if isinstance(gt_polar, torch.Tensor) else np.asarray(gt_polar)
+    pred_array = pred_polar.detach().float().cpu().numpy() if isinstance(pred_polar, torch.Tensor) else np.asarray(pred_polar)
+    if gt_array.ndim == 3 and gt_array.shape[-1] == 3:
+        gt_array = np.moveaxis(gt_array, -1, 0)
+    if pred_array.ndim == 3 and pred_array.shape[-1] == 3:
+        pred_array = np.moveaxis(pred_array, -1, 0)
+
+    panels = [
+        ("Captured AoLP", polar_to_aolp_deg(gt_array), "hsv", -90.0, 90.0, [-90.0, 0.0, 90.0]),
+        ("Captured DoLP", np.clip(gt_array[0], 0.0, 1.0), "GnBu", 0.0, 1.0, [0.0, 1.0]),
+        ("Gen. AoLP", polar_to_aolp_deg(pred_array), "hsv", -90.0, 90.0, [-90.0, 0.0, 90.0]),
+        ("Gen. DoLP", np.clip(pred_array[0], 0.0, 1.0), "GnBu", 0.0, 1.0, [0.0, 1.0]),
+    ]
+
+    fig, axes = plt.subplots(2, 2, figsize=(10, 7), constrained_layout=True)
+    fig.patch.set_facecolor("white")
+    fig.patches.extend(
+        [
+            plt.Rectangle((0.0, 0.5), 1.0, 0.5, transform=fig.transFigure, color="#fff0f4", zorder=-1),
+            plt.Rectangle((0.0, 0.0), 1.0, 0.5, transform=fig.transFigure, color="#eefcff", zorder=-1),
+        ]
+    )
+    for axis, (title, image, cmap, vmin, vmax, ticks) in zip(axes.flat, panels):
+        axis.set_facecolor("#fff0f4" if "Captured" in title else "#eefcff")
+        im = axis.imshow(image, cmap=cmap, vmin=vmin, vmax=vmax)
+        axis.set_title(title, fontsize=13)
+        axis.axis("off")
+        colorbar = fig.colorbar(im, ax=axis, fraction=0.046, pad=0.03)
+        colorbar.set_ticks(ticks)
+        if "AoLP" in title:
+            colorbar.set_ticklabels([r"$-90^\circ$", r"$0^\circ$", r"$90^\circ$"])
+        else:
+            colorbar.set_ticklabels(["0", "1"])
+        colorbar.ax.tick_params(labelsize=10)
+
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
 
 
 def save_visualization(
@@ -389,11 +450,13 @@ def run(args: argparse.Namespace) -> None:
     stage1_encoding_dir = output_dir / "stage1_encoding_png"
     gt_encoding_dir = output_dir / "gt_encoding_png"
     vis_dir = output_dir / "vis"
+    paper_vis_dir = output_dir / "paper_vis"
     refined_dir.mkdir(parents=True, exist_ok=True)
     pred_encoding_dir.mkdir(parents=True, exist_ok=True)
     stage1_encoding_dir.mkdir(parents=True, exist_ok=True)
     gt_encoding_dir.mkdir(parents=True, exist_ok=True)
     vis_dir.mkdir(parents=True, exist_ok=True)
+    paper_vis_dir.mkdir(parents=True, exist_ok=True)
 
     dataloader, dataset_size = build_dataloader(args, device)
     model = build_model(args, device)
@@ -449,6 +512,13 @@ def run(args: argparse.Namespace) -> None:
                 row.update(prefix_metrics("stage1", compute_metric_dict(prior_eval, sample_gt)))
                 row.update(prefix_metrics("stage2", compute_metric_dict(refined_eval, sample_gt)))
                 rows.append(row)
+
+                save_paper_aop_dop_vis(
+                    rgb_or_none=None,
+                    gt_polar=sample_gt,
+                    pred_polar=refined_eval,
+                    save_path=paper_vis_dir / f"{name}_aop_dop_compare.png",
+                )
 
                 if args.vis_every > 0 and sample_index % args.vis_every == 0:
                     save_visualization(
