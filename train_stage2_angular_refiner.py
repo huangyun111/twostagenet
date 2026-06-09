@@ -12,7 +12,9 @@ from pathlib import Path
 import matplotlib
 import numpy as np
 import torch
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Subset
+from torch.utils.data.distributed import DistributedSampler
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -21,6 +23,14 @@ if str(PROJECT_ROOT) not in sys.path:
 from datasets.stage2_residual_dataset import Stage2ResidualDataset  # noqa: E402
 from losses.stage2_angular_refiner_loss import Stage2AngularRefinerLoss  # noqa: E402
 from models.stage2_angular_refiner_net import ConfidenceGuidedAngularResidualRefiner  # noqa: E402
+from utils.ddp_utils import (  # noqa: E402
+    barrier,
+    cleanup_distributed,
+    get_rank,
+    get_world_size,
+    is_main_process,
+    setup_distributed,
+)
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
@@ -82,6 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_optimizer", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--max_train_samples", type=int, default=None)
     parser.add_argument("--max_val_samples", type=int, default=None)
+    parser.add_argument("--distributed", action="store_true")
     return parser.parse_args()
 
 
@@ -120,7 +131,8 @@ def build_dataloader(
     shuffle: bool,
     max_samples: int | None,
     pin_memory: bool,
-) -> tuple[DataLoader, int]:
+    distributed: bool = False,
+) -> tuple[DataLoader, int, DistributedSampler | None]:
     dataset = Stage2ResidualDataset(
         root_dir=root_dir,
         stage1_dir=stage1_dir,
@@ -134,14 +146,20 @@ def build_dataloader(
         if max_samples <= 0:
             raise ValueError("max_samples must be positive or None.")
         dataset = Subset(dataset, range(min(max_samples, len(dataset))))
+    sampler = (
+        DistributedSampler(dataset, shuffle=shuffle, drop_last=False)
+        if distributed
+        else None
+    )
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=shuffle and sampler is None,
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
     )
-    return dataloader, len(dataset)
+    return dataloader, len(dataset), sampler
 
 
 def build_val_dataloader(args: argparse.Namespace, device: torch.device) -> tuple[DataLoader, int] | tuple[None, int]:
@@ -151,7 +169,7 @@ def build_val_dataloader(args: argparse.Namespace, device: torch.device) -> tupl
         return None, 0
     if val_root_dir is None or val_stage1_dir is None:
         raise ValueError("val_root_dir and val_stage1_dir must be provided together.")
-    return build_dataloader(
+    dataloader, size, _ = build_dataloader(
         root_dir=val_root_dir,
         stage1_dir=val_stage1_dir,
         image_size=args.image_size,
@@ -164,7 +182,9 @@ def build_val_dataloader(args: argparse.Namespace, device: torch.device) -> tupl
         shuffle=False,
         max_samples=args.max_val_samples,
         pin_memory=device.type == "cuda",
+        distributed=False,
     )
+    return dataloader, size
 
 
 def build_model(args: argparse.Namespace, device: torch.device) -> ConfidenceGuidedAngularResidualRefiner:
@@ -187,10 +207,11 @@ def save_checkpoint(
     args: argparse.Namespace,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    model_to_save = model.module if hasattr(model, "module") else model
     checkpoint = {
         "epoch": epoch,
         "global_step": global_step,
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": model_to_save.state_dict(),
         "best_val_loss": best_val_loss,
         "args": vars(args),
     }
@@ -313,7 +334,7 @@ def train_one_epoch(
                 "pred": {key: value.detach().cpu() for key, value in pred.items()},
             }
 
-        if log_freq > 0 and global_step % log_freq == 0:
+        if log_freq > 0 and global_step % log_freq == 0 and is_main_process():
             print(
                 f"epoch {epoch}/{num_epochs} "
                 f"step {global_step} "
@@ -427,15 +448,19 @@ def main() -> None:
         raise ValueError("save_total_limit must be non-negative or None.")
 
     set_seed(args.seed)
-    device = resolve_device(args.device)
+    device, distributed = setup_distributed(args)
+    rank = get_rank()
+    world_size = get_world_size()
     save_dir = Path(args.save_dir)
     vis_dir = save_dir / "vis"
-    save_dir.mkdir(parents=True, exist_ok=True)
-    vis_dir.mkdir(parents=True, exist_ok=True)
+    if is_main_process():
+        save_dir.mkdir(parents=True, exist_ok=True)
+        vis_dir.mkdir(parents=True, exist_ok=True)
+        write_config(save_dir / "config.json", args)
+    barrier()
     log_path = save_dir / "train_log.txt"
-    write_config(save_dir / "config.json", args)
 
-    train_loader, train_size = build_dataloader(
+    train_loader, train_size, train_sampler = build_dataloader(
         root_dir=args.root_dir,
         stage1_dir=args.stage1_dir,
         image_size=args.image_size,
@@ -448,8 +473,12 @@ def main() -> None:
         shuffle=True,
         max_samples=args.max_train_samples,
         pin_memory=device.type == "cuda",
+        distributed=distributed,
     )
-    val_loader, val_size = build_val_dataloader(args, device)
+    if is_main_process():
+        val_loader, val_size = build_val_dataloader(args, device)
+    else:
+        val_loader, val_size = None, 0
 
     model = build_model(args, device)
     loss_fn = Stage2AngularRefinerLoss().to(device)
@@ -470,92 +499,113 @@ def main() -> None:
             device,
         )
 
-    append_log(
-        log_path,
-        f"Start Stage2 angular refiner training on {device}, "
-        f"train_samples={train_size}, val_samples={val_size}, "
-        f"batch_size={args.batch_size}, base_channels={args.base_channels}, "
-        f"residual_scale={args.residual_scale}, "
-        f"angle_residual_scale={args.angle_residual_scale}, min_gate={args.min_gate}, "
-        f"preprocess_mode={args.preprocess_mode}, crop_size={args.crop_size}, "
-        f"normalize_mode={args.normalize_mode}, save_optimizer={args.save_optimizer}, "
-        f"root_dir={args.root_dir}, stage1_dir={args.stage1_dir}, "
-        f"val_root_dir={args.val_root_dir}, val_stage1_dir={args.val_stage1_dir}, "
-        f"num_epochs={args.num_epochs}, lr={args.lr}, weight_decay={args.weight_decay}",
-    )
-
-    for epoch in range(start_epoch, args.num_epochs + 1):
-        train_metrics, global_step, vis_data = train_one_epoch(
-            model=model,
-            loss_fn=loss_fn,
-            dataloader=train_loader,
-            optimizer=optimizer,
-            device=device,
-            epoch=epoch,
-            num_epochs=args.num_epochs,
-            log_freq=args.log_freq,
-            global_step=global_step,
-        )
-
-        val_metrics = None
-        if val_loader is not None:
-            val_metrics = evaluate(model, loss_fn, val_loader, device)
-            current_score = val_metrics["loss"]
-            if current_score < best_score:
-                best_score = current_score
-                save_checkpoint(
-                    save_dir / "best_val.pth",
-                    epoch,
-                    global_step,
-                    model,
-                    optimizer,
-                    best_score,
-                    args,
-                )
-        else:
-            current_score = train_metrics["loss"]
-            if current_score < best_score:
-                best_score = current_score
-                save_checkpoint(
-                    save_dir / "best_train.pth",
-                    epoch,
-                    global_step,
-                    model,
-                    optimizer,
-                    best_score,
-                    args,
-                )
-
-        save_checkpoint(
-            save_dir / "last.pth",
-            epoch,
-            global_step,
+    if distributed:
+        model = DistributedDataParallel(
             model,
-            optimizer,
-            best_score,
-            args,
+            device_ids=[args.local_rank],
+            output_device=args.local_rank,
+            find_unused_parameters=False,
         )
-        if args.save_freq > 0 and epoch % args.save_freq == 0:
-            save_checkpoint(
-                save_dir / f"epoch_{epoch:04d}.pth",
-                epoch,
-                global_step,
-                model,
-                optimizer,
-                best_score,
-                args,
+
+    try:
+        if is_main_process():
+            append_log(
+                log_path,
+                f"Start Stage2 angular refiner training on {device}, "
+                f"train_samples={train_size}, val_samples={val_size}, "
+                f"batch_size_per_gpu={args.batch_size}, world_size={world_size}, "
+                f"rank={rank}, local_rank={args.local_rank}, "
+                f"effective_batch_size={args.batch_size * world_size}, "
+                f"distributed={distributed}, base_channels={args.base_channels}, "
+                f"residual_scale={args.residual_scale}, "
+                f"angle_residual_scale={args.angle_residual_scale}, min_gate={args.min_gate}, "
+                f"preprocess_mode={args.preprocess_mode}, crop_size={args.crop_size}, "
+                f"normalize_mode={args.normalize_mode}, save_optimizer={args.save_optimizer}, "
+                f"root_dir={args.root_dir}, stage1_dir={args.stage1_dir}, "
+                f"val_root_dir={args.val_root_dir}, val_stage1_dir={args.val_stage1_dir}, "
+                f"num_epochs={args.num_epochs}, lr={args.lr}, weight_decay={args.weight_decay}",
             )
-            prune_epoch_checkpoints(save_dir, args.save_total_limit)
 
-        message = f"epoch {epoch}/{args.num_epochs} | {format_metrics('train', train_metrics)}"
-        if val_metrics is not None:
-            message += " | " + format_metrics("val", val_metrics)
-        append_log(log_path, message)
+        for epoch in range(start_epoch, args.num_epochs + 1):
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
+            train_metrics, global_step, vis_data = train_one_epoch(
+                model=model,
+                loss_fn=loss_fn,
+                dataloader=train_loader,
+                optimizer=optimizer,
+                device=device,
+                epoch=epoch,
+                num_epochs=args.num_epochs,
+                log_freq=args.log_freq,
+                global_step=global_step,
+            )
 
-        if vis_data is not None and should_save_vis(epoch, args.num_epochs):
-            save_visualization(vis_data, vis_dir / f"epoch_{epoch:03d}.png")
+            if is_main_process():
+                eval_model = model.module if hasattr(model, "module") else model
+                val_metrics = None
+                if val_loader is not None:
+                    val_metrics = evaluate(eval_model, loss_fn, val_loader, device)
+                    current_score = val_metrics["loss"]
+                    if current_score < best_score:
+                        best_score = current_score
+                        save_checkpoint(
+                            save_dir / "best_val.pth",
+                            epoch,
+                            global_step,
+                            model,
+                            optimizer,
+                            best_score,
+                            args,
+                        )
+                else:
+                    current_score = train_metrics["loss"]
+                    if current_score < best_score:
+                        best_score = current_score
+                        save_checkpoint(
+                            save_dir / "best_train.pth",
+                            epoch,
+                            global_step,
+                            model,
+                            optimizer,
+                            best_score,
+                            args,
+                        )
 
-    append_log(log_path, f"Finished training. best_loss={best_score:.6f}")
+                save_checkpoint(
+                    save_dir / "last.pth",
+                    epoch,
+                    global_step,
+                    model,
+                    optimizer,
+                    best_score,
+                    args,
+                )
+                if args.save_freq > 0 and epoch % args.save_freq == 0:
+                    save_checkpoint(
+                        save_dir / f"epoch_{epoch:04d}.pth",
+                        epoch,
+                        global_step,
+                        model,
+                        optimizer,
+                        best_score,
+                        args,
+                    )
+                    prune_epoch_checkpoints(save_dir, args.save_total_limit)
+
+                message = f"epoch {epoch}/{args.num_epochs} | {format_metrics('train', train_metrics)}"
+                if val_metrics is not None:
+                    message += " | " + format_metrics("val", val_metrics)
+                append_log(log_path, message)
+
+                if vis_data is not None and should_save_vis(epoch, args.num_epochs):
+                    save_visualization(vis_data, vis_dir / f"epoch_{epoch:03d}.png")
+            barrier()
+
+        if is_main_process():
+            append_log(log_path, f"Finished training. best_loss={best_score:.6f}")
+    finally:
+        cleanup_distributed()
 
 
 if __name__ == "__main__":

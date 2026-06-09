@@ -11,11 +11,21 @@ from typing import Any
 import matplotlib
 import numpy as np
 import torch
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 from datasets.stage1_prior_dataset import Stage1PriorDataset
 from losses.stage1_prior_loss import Stage1PriorLoss
 from models.polar_prior_net import PolarPriorNet
+from utils.ddp_utils import (
+    barrier,
+    cleanup_distributed,
+    get_rank,
+    get_world_size,
+    is_main_process,
+    setup_distributed,
+)
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
@@ -53,6 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vis_freq", type=int, default=5)
     parser.add_argument("--save_freq", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--distributed", action="store_true")
     return parser.parse_args()
 
 
@@ -110,9 +121,10 @@ def save_checkpoint(
     best_loss: float,
     args: argparse.Namespace,
 ) -> None:
+    model_to_save = model.module if hasattr(model, "module") else model
     checkpoint = {
         "epoch": epoch,
-        "model": model.state_dict(),
+        "model": model_to_save.state_dict(),
         "optimizer": optimizer.state_dict(),
         "best_loss": best_loss,
         "args": vars(args),
@@ -127,11 +139,36 @@ def load_checkpoint(
     device: torch.device,
 ) -> tuple[int, float]:
     checkpoint = torch.load(path, map_location=device)
-    model.load_state_dict(checkpoint["model"])
-    optimizer.load_state_dict(checkpoint["optimizer"])
-    start_epoch = int(checkpoint["epoch"]) + 1
-    best_loss = float(checkpoint.get("best_loss", float("inf")))
+    if isinstance(checkpoint, dict):
+        state_dict = checkpoint.get("model", checkpoint.get("model_state_dict", checkpoint))
+    else:
+        state_dict = checkpoint
+    model.load_state_dict(strip_module_prefix(state_dict))
+    if isinstance(checkpoint, dict):
+        optimizer_state = checkpoint.get("optimizer", checkpoint.get("optimizer_state_dict"))
+        if optimizer_state is not None:
+            optimizer.load_state_dict(optimizer_state)
+            move_optimizer_state_to_device(optimizer, device)
+    start_epoch = int(checkpoint.get("epoch", 0)) + 1 if isinstance(checkpoint, dict) else 1
+    best_loss = float(checkpoint.get("best_loss", float("inf"))) if isinstance(checkpoint, dict) else float("inf")
     return start_epoch, best_loss
+
+
+def strip_module_prefix(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    return {
+        key[7:] if key.startswith("module.") else key: value
+        for key, value in state_dict.items()
+    }
+
+
+def move_optimizer_state_to_device(
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> None:
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if isinstance(value, torch.Tensor):
+                state[key] = value.to(device)
 
 
 def append_log(log_path: Path, message: str) -> None:
@@ -271,15 +308,18 @@ def main() -> None:
     args = parse_args()
     args.encoder_weights = normalize_encoder_weights(args.encoder_weights)
     set_seed(args.seed)
+    device, distributed = setup_distributed(args)
+    rank = get_rank()
+    world_size = get_world_size()
 
     save_dir = Path(args.save_dir)
     vis_dir = save_dir / "vis"
-    save_dir.mkdir(parents=True, exist_ok=True)
-    vis_dir.mkdir(parents=True, exist_ok=True)
+    if is_main_process():
+        save_dir.mkdir(parents=True, exist_ok=True)
+        vis_dir.mkdir(parents=True, exist_ok=True)
+        write_config(save_dir / "config.json", args)
+    barrier()
     log_path = save_dir / "train_log.txt"
-    write_config(save_dir / "config.json", args)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     dataset = Stage1PriorDataset(
         root_dir=args.root_dir,
@@ -289,10 +329,16 @@ def main() -> None:
         normalize_mode=args.normalize_mode,
         random_crop=args.preprocess_mode == "official_train",
     )
+    train_sampler = (
+        DistributedSampler(dataset, shuffle=True, drop_last=False)
+        if distributed
+        else None
+    )
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
     )
@@ -306,58 +352,77 @@ def main() -> None:
     if args.resume:
         start_epoch, best_loss = load_checkpoint(args.resume, model, optimizer, device)
 
-    append_log(
-        log_path,
-        f"Start training on {device}, samples={len(dataset)}, "
-        f"batch_size={args.batch_size}, lrs={format_lrs(optimizer)}, "
-        f"preprocess_mode={args.preprocess_mode}, crop_size={args.crop_size}, "
-        f"normalize_mode={args.normalize_mode}, root_dir={args.root_dir}, "
-        f"num_epochs={args.num_epochs}, lr={args.lr}, encoder_lr={args.encoder_lr}, "
-        f"encoder_weights={args.encoder_weights}",
-    )
-
-    for epoch in range(start_epoch, args.num_epochs + 1):
-        metrics, vis_data = train_one_epoch(model, loss_fn, dataloader, optimizer, device)
-
-        message = (
-            f"epoch {epoch}/{args.num_epochs} | "
-            f"loss={metrics['loss']:.6f} | "
-            f"loss_dolp={metrics['loss_dolp']:.6f} | "
-            f"loss_aolp={metrics['loss_aolp']:.6f} | "
-            f"loss_conf={metrics['loss_conf']:.6f} | "
-            f"loss_unc={metrics['loss_unc']:.6f} | "
-            f"loss_lowfreq={metrics['loss_lowfreq']:.6f} | "
-            f"loss_edge={metrics['loss_edge']:.6f} | "
-            f"aolp_rel={metrics['mean_aolp_reliability']:.6f} | "
-            f"conf_dolp={metrics['mean_conf_dolp']:.6f} | "
-            f"conf_aolp={metrics['mean_conf_aolp']:.6f} | "
-            f"lr={format_lrs(optimizer)}"
+    if distributed:
+        model = DistributedDataParallel(
+            model,
+            device_ids=[args.local_rank],
+            output_device=args.local_rank,
+            find_unused_parameters=False,
         )
-        append_log(log_path, message)
 
-        if metrics["loss"] < best_loss:
-            best_loss = metrics["loss"]
-            save_checkpoint(save_dir / "best.pth", epoch, model, optimizer, best_loss, args)
-
-        save_checkpoint(save_dir / "last.pth", epoch, model, optimizer, best_loss, args)
-
-        if args.save_freq > 0 and epoch % args.save_freq == 0:
-            save_checkpoint(
-                save_dir / f"epoch_{epoch:03d}.pth",
-                epoch,
-                model,
-                optimizer,
-                best_loss,
-                args,
+    try:
+        if is_main_process():
+            append_log(
+                log_path,
+                f"Start training on {device}, samples={len(dataset)}, "
+                f"batch_size_per_gpu={args.batch_size}, world_size={world_size}, "
+                f"rank={rank}, local_rank={args.local_rank}, "
+                f"effective_batch_size={args.batch_size * world_size}, "
+                f"distributed={distributed}, lrs={format_lrs(optimizer)}, "
+                f"preprocess_mode={args.preprocess_mode}, crop_size={args.crop_size}, "
+                f"normalize_mode={args.normalize_mode}, root_dir={args.root_dir}, "
+                f"num_epochs={args.num_epochs}, lr={args.lr}, encoder_lr={args.encoder_lr}, "
+                f"encoder_weights={args.encoder_weights}",
             )
 
-        if args.vis_freq > 0 and epoch % args.vis_freq == 0 and vis_data is not None:
-            save_visualization(
-                vis_data["rgb"],
-                vis_data["target"],
-                vis_data["pred_dict"],
-                vis_dir / f"epoch_{epoch:03d}.png",
-            )
+        for epoch in range(start_epoch, args.num_epochs + 1):
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
+            metrics, vis_data = train_one_epoch(model, loss_fn, dataloader, optimizer, device)
+
+            if is_main_process():
+                message = (
+                    f"epoch {epoch}/{args.num_epochs} | "
+                    f"loss={metrics['loss']:.6f} | "
+                    f"loss_dolp={metrics['loss_dolp']:.6f} | "
+                    f"loss_aolp={metrics['loss_aolp']:.6f} | "
+                    f"loss_conf={metrics['loss_conf']:.6f} | "
+                    f"loss_unc={metrics['loss_unc']:.6f} | "
+                    f"loss_lowfreq={metrics['loss_lowfreq']:.6f} | "
+                    f"loss_edge={metrics['loss_edge']:.6f} | "
+                    f"aolp_rel={metrics['mean_aolp_reliability']:.6f} | "
+                    f"conf_dolp={metrics['mean_conf_dolp']:.6f} | "
+                    f"conf_aolp={metrics['mean_conf_aolp']:.6f} | "
+                    f"lr={format_lrs(optimizer)}"
+                )
+                append_log(log_path, message)
+
+                if metrics["loss"] < best_loss:
+                    best_loss = metrics["loss"]
+                    save_checkpoint(save_dir / "best.pth", epoch, model, optimizer, best_loss, args)
+
+                save_checkpoint(save_dir / "last.pth", epoch, model, optimizer, best_loss, args)
+
+                if args.save_freq > 0 and epoch % args.save_freq == 0:
+                    save_checkpoint(
+                        save_dir / f"epoch_{epoch:03d}.pth",
+                        epoch,
+                        model,
+                        optimizer,
+                        best_loss,
+                        args,
+                    )
+
+                if args.vis_freq > 0 and epoch % args.vis_freq == 0 and vis_data is not None:
+                    save_visualization(
+                        vis_data["rgb"],
+                        vis_data["target"],
+                        vis_data["pred_dict"],
+                        vis_dir / f"epoch_{epoch:03d}.png",
+                    )
+            barrier()
+    finally:
+        cleanup_distributed()
 
 
 if __name__ == "__main__":
