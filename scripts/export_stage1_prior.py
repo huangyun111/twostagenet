@@ -15,6 +15,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from datasets.manifest_dataset import Stage1ManifestDataset  # noqa: E402
 from datasets.stage1_prior_dataset import Stage1PriorDataset  # noqa: E402
 from models.polar_prior_net import PolarPriorNet  # noqa: E402
 
@@ -27,6 +28,26 @@ def parse_args() -> argparse.Namespace:
         description="Export Stage 1 prior and confidence maps."
     )
     parser.add_argument("--root_dir", type=str, default=str(Path.home() / "Documents"))
+    parser.add_argument(
+        "--manifest",
+        type=str,
+        default="",
+        help="Path to assembly_manifest.json. When set, the 13168 clean-split "
+        "manifest dataset is used (native 480, exports keyed by <scene>_<frame>).",
+    )
+    parser.add_argument(
+        "--dataset_root",
+        type=str,
+        default="",
+        help="Directory the manifest frame paths are relative to (manifest mode).",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="train",
+        choices=("train", "val", "test", "all"),
+        help="Which manifest split to export (manifest mode only).",
+    )
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--output_dir", type=str, default="./stage1_exports")
     parser.add_argument("--image_size", type=int, default=256)
@@ -197,10 +218,11 @@ def export_batch(
 
 def main() -> None:
     args = parse_args()
-    if args.preprocess_mode == "official_infer" and args.batch_size != 1:
-        raise ValueError("official_infer keeps native sizes; use --batch_size 1.")
-    if args.preprocess_mode == "official_infer" and args.output_size_mode != "native":
-        raise ValueError("official_infer expects --output_size_mode native.")
+    if not args.manifest:
+        if args.preprocess_mode == "official_infer" and args.batch_size != 1:
+            raise ValueError("official_infer keeps native sizes; use --batch_size 1.")
+        if args.preprocess_mode == "official_infer" and args.output_size_mode != "native":
+            raise ValueError("official_infer expects --output_size_mode native.")
     device = resolve_device(args.device)
 
     output_dir = Path(args.output_dir)
@@ -211,15 +233,28 @@ def main() -> None:
     confidence_dir.mkdir(parents=True, exist_ok=True)
     vis_dir.mkdir(parents=True, exist_ok=True)
 
-    dataset = Stage1PriorDataset(
-        root_dir=args.root_dir,
-        image_size=args.image_size if args.output_size_mode == "fixed" else None,
-        preprocess_mode=args.preprocess_mode,
-        normalize_mode=args.normalize_mode,
-        divisible_by=args.divisible_by,
-        augment=False,
-        return_path=False,
-    )
+    if args.manifest:
+        # Native 480 export keyed by <scene>_<frame>; corrupted PNGs already
+        # excluded inside Stage1ManifestDataset. Uniform size -> batch_size>1 OK.
+        dataset = Stage1ManifestDataset(
+            manifest_path=args.manifest,
+            dataset_root=args.dataset_root or None,
+            split=args.split,
+            image_size=None,
+            crop_size=0,
+            random_crop=False,
+            augment=False,
+        )
+    else:
+        dataset = Stage1PriorDataset(
+            root_dir=args.root_dir,
+            image_size=args.image_size if args.output_size_mode == "fixed" else None,
+            preprocess_mode=args.preprocess_mode,
+            normalize_mode=args.normalize_mode,
+            divisible_by=args.divisible_by,
+            augment=False,
+            return_path=False,
+        )
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,

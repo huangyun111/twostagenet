@@ -19,6 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from datasets.stage2_residual_dataset import Stage2ResidualDataset  # noqa: E402
+from datasets.manifest_dataset import Stage2ManifestDataset  # noqa: E402
 from models.stage2_angular_refiner_net import ConfidenceGuidedAngularResidualRefiner  # noqa: E402
 
 matplotlib.use("Agg")
@@ -45,6 +46,23 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Infer and evaluate Stage 2 angular refiner.")
     parser.add_argument("--root_dir", type=str, default=str(Path.home() / "Documents"))
     parser.add_argument("--stage1_dir", type=str, default="./stage1_exports")
+    parser.add_argument(
+        "--manifest",
+        type=str,
+        default="",
+        help="Path to assembly_manifest.json. When set, the 13168 clean-split "
+        "manifest (native 480, keyed by <scene>_<frame>) is used: --split picks "
+        "the split (default test), prior/confidence read from --stage1_dir. "
+        "--root_dir is ignored in this mode.",
+    )
+    parser.add_argument("--dataset_root", type=str, default="")
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="test",
+        choices=("train", "val", "test", "all"),
+        help="Manifest split to evaluate (manifest mode only).",
+    )
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--output_dir", type=str, default="./stage2_angular_refiner_outputs")
     parser.add_argument("--image_size", type=int, default=256)
@@ -64,6 +82,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--vis_every", type=int, default=50)
+    parser.add_argument(
+        "--paper_vis_every",
+        type=int,
+        default=50,
+        help="Save the 2x2 captured-vs-generated AoLP/DoLP paper figure every N "
+        "samples (0 disables). Avoids one matplotlib render per frame on large "
+        "test sets; metrics are unaffected.",
+    )
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--residual_scale", type=float, default=0.3)
     parser.add_argument("--angle_residual_scale", type=float, default=math.pi)
@@ -79,14 +105,25 @@ def resolve_device(device_arg: str) -> torch.device:
 
 
 def build_dataloader(args: argparse.Namespace, device: torch.device) -> tuple[DataLoader, int]:
-    dataset = Stage2ResidualDataset(
-        root_dir=args.root_dir,
-        stage1_dir=args.stage1_dir,
-        image_size=args.image_size,
-        preprocess_mode=args.preprocess_mode,
-        normalize_mode=args.normalize_mode,
-        divisible_by=args.divisible_by,
-    )
+    if args.manifest:
+        # 13168 clean-split manifest, native 480. prior/confidence come from the
+        # Stage1 export under --stage1_dir; sizes already match GT so no resize.
+        dataset = Stage2ManifestDataset(
+            manifest_path=args.manifest,
+            stage1_dir=args.stage1_dir,
+            dataset_root=args.dataset_root or None,
+            split=args.split,
+            augment=False,
+        )
+    else:
+        dataset = Stage2ResidualDataset(
+            root_dir=args.root_dir,
+            stage1_dir=args.stage1_dir,
+            image_size=args.image_size,
+            preprocess_mode=args.preprocess_mode,
+            normalize_mode=args.normalize_mode,
+            divisible_by=args.divisible_by,
+        )
     if args.max_samples is not None:
         if args.max_samples <= 0:
             raise ValueError("max_samples must be positive or None.")
@@ -513,12 +550,13 @@ def run(args: argparse.Namespace) -> None:
                 row.update(prefix_metrics("stage2", compute_metric_dict(refined_eval, sample_gt)))
                 rows.append(row)
 
-                save_paper_aop_dop_vis(
-                    rgb_or_none=None,
-                    gt_polar=sample_gt,
-                    pred_polar=refined_eval,
-                    save_path=paper_vis_dir / f"{name}_aop_dop_compare.png",
-                )
+                if args.paper_vis_every > 0 and sample_index % args.paper_vis_every == 0:
+                    save_paper_aop_dop_vis(
+                        rgb_or_none=None,
+                        gt_polar=sample_gt,
+                        pred_polar=refined_eval,
+                        save_path=paper_vis_dir / f"{name}_aop_dop_compare.png",
+                    )
 
                 if args.vis_every > 0 and sample_index % args.vis_every == 0:
                     save_visualization(

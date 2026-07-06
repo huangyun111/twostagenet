@@ -12,9 +12,10 @@ import matplotlib
 import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 
+from datasets.manifest_dataset import Stage1ManifestDataset
 from datasets.stage1_prior_dataset import Stage1PriorDataset
 from losses.stage1_prior_loss import Stage1PriorLoss
 from models.polar_prior_net import PolarPriorNet
@@ -39,6 +40,47 @@ def parse_args() -> argparse.Namespace:
         "--root_dir",
         type=str,
         default=r"D:\PolarAnything\data\PolarAnything_subset",
+    )
+    parser.add_argument(
+        "--manifest",
+        type=str,
+        default="",
+        help="Path to assembly_manifest.json. When set, the 13168 clean-split "
+        "manifest dataset is used instead of --root_dir.",
+    )
+    parser.add_argument(
+        "--dataset_root",
+        type=str,
+        default="",
+        help="Directory the manifest frame paths are relative to. Defaults to "
+        "the manifest's grandparent dir.",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="train",
+        choices=("train", "val", "test", "all"),
+        help="Which manifest split to train on (manifest mode only).",
+    )
+    parser.add_argument(
+        "--val_split",
+        type=str,
+        default="val",
+        choices=("none", "train", "val", "test"),
+        help="Manifest split used for val checkpoint selection (manifest mode "
+        "only). 'none' disables validation and falls back to train-loss best.",
+    )
+    parser.add_argument(
+        "--max_train_samples",
+        type=int,
+        default=None,
+        help="Cap the number of training samples (for smoke tests).",
+    )
+    parser.add_argument(
+        "--max_val_samples",
+        type=int,
+        default=None,
+        help="Cap the number of validation samples (for smoke tests).",
     )
     parser.add_argument("--save_dir", type=str, default="./checkpoints_stage1_prior")
     parser.add_argument("--image_size", type=int, default=256)
@@ -304,6 +346,42 @@ def train_one_epoch(
     return averages, vis_data
 
 
+def evaluate(
+    model: torch.nn.Module,
+    loss_fn: Stage1PriorLoss,
+    dataloader: DataLoader,
+    device: torch.device,
+) -> dict[str, float]:
+    """Run a no-grad pass over the val split and average the loss terms."""
+    model.eval()
+    sums = {
+        "loss": 0.0,
+        "loss_dolp": 0.0,
+        "loss_aolp": 0.0,
+        "loss_conf": 0.0,
+        "loss_unc": 0.0,
+        "loss_lowfreq": 0.0,
+        "loss_edge": 0.0,
+        "mean_aolp_reliability": 0.0,
+        "mean_conf_dolp": 0.0,
+        "mean_conf_aolp": 0.0,
+    }
+    num_samples = 0
+    with torch.no_grad():
+        for batch in dataloader:
+            rgb = batch["rgb"].to(device, non_blocking=True)
+            target = batch["polar"].to(device, non_blocking=True)
+            batch_size = rgb.shape[0]
+            pred_dict = model(rgb)
+            loss_dict = loss_fn(pred_dict, target)
+            num_samples += batch_size
+            for key in sums:
+                sums[key] += float(loss_dict[key].detach()) * batch_size
+    if num_samples == 0:
+        raise RuntimeError("Validation dataloader produced no samples.")
+    return {key: value / num_samples for key, value in sums.items()}
+
+
 def main() -> None:
     args = parse_args()
     args.encoder_weights = normalize_encoder_weights(args.encoder_weights)
@@ -321,14 +399,29 @@ def main() -> None:
     barrier()
     log_path = save_dir / "train_log.txt"
 
-    dataset = Stage1PriorDataset(
-        root_dir=args.root_dir,
-        image_size=args.image_size,
-        preprocess_mode=args.preprocess_mode,
-        crop_size=args.crop_size,
-        normalize_mode=args.normalize_mode,
-        random_crop=args.preprocess_mode == "official_train",
-    )
+    if args.manifest:
+        dataset = Stage1ManifestDataset(
+            manifest_path=args.manifest,
+            dataset_root=args.dataset_root or None,
+            split=args.split,
+            image_size=args.image_size if args.preprocess_mode == "resize256" else None,
+            crop_size=args.crop_size if args.preprocess_mode == "official_train" else 0,
+            random_crop=args.preprocess_mode == "official_train",
+            augment=args.preprocess_mode == "official_train",
+        )
+    else:
+        dataset = Stage1PriorDataset(
+            root_dir=args.root_dir,
+            image_size=args.image_size,
+            preprocess_mode=args.preprocess_mode,
+            crop_size=args.crop_size,
+            normalize_mode=args.normalize_mode,
+            random_crop=args.preprocess_mode == "official_train",
+        )
+    if args.max_train_samples is not None:
+        if args.max_train_samples <= 0:
+            raise ValueError("max_train_samples must be positive or None.")
+        dataset = Subset(dataset, range(min(args.max_train_samples, len(dataset))))
     train_sampler = (
         DistributedSampler(dataset, shuffle=True, drop_last=False)
         if distributed
@@ -343,12 +436,43 @@ def main() -> None:
         pin_memory=device.type == "cuda",
     )
 
+    # Validation loader for clean val-based checkpoint selection (manifest mode
+    # only). Evaluated on the main process only; no random crop / augmentation so
+    # full 480x480 frames are scored deterministically.
+    val_loader = None
+    val_size = 0
+    if args.manifest and args.val_split != "none" and is_main_process():
+        val_dataset = Stage1ManifestDataset(
+            manifest_path=args.manifest,
+            dataset_root=args.dataset_root or None,
+            split=args.val_split,
+            image_size=args.image_size if args.preprocess_mode == "resize256" else None,
+            crop_size=args.crop_size if args.preprocess_mode == "official_train" else 0,
+            random_crop=False,
+            augment=False,
+        )
+        if args.max_val_samples is not None:
+            if args.max_val_samples <= 0:
+                raise ValueError("max_val_samples must be positive or None.")
+            val_dataset = Subset(
+                val_dataset, range(min(args.max_val_samples, len(val_dataset)))
+            )
+        val_size = len(val_dataset)
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=device.type == "cuda",
+        )
+
     model = PolarPriorNet(encoder_weights=args.encoder_weights).to(device)
     loss_fn = Stage1PriorLoss().to(device)
     optimizer = build_optimizer(model, args.lr, args.encoder_lr)
 
     start_epoch = 1
     best_loss = float("inf")
+    best_val_loss = float("inf")
     if args.resume:
         start_epoch, best_loss = load_checkpoint(args.resume, model, optimizer, device)
 
@@ -381,6 +505,11 @@ def main() -> None:
             metrics, vis_data = train_one_epoch(model, loss_fn, dataloader, optimizer, device)
 
             if is_main_process():
+                val_metrics = None
+                if val_loader is not None:
+                    eval_model = model.module if hasattr(model, "module") else model
+                    val_metrics = evaluate(eval_model, loss_fn, val_loader, device)
+
                 message = (
                     f"epoch {epoch}/{args.num_epochs} | "
                     f"loss={metrics['loss']:.6f} | "
@@ -395,7 +524,21 @@ def main() -> None:
                     f"conf_aolp={metrics['mean_conf_aolp']:.6f} | "
                     f"lr={format_lrs(optimizer)}"
                 )
+                if val_metrics is not None:
+                    message += (
+                        f" || val_loss={val_metrics['loss']:.6f} | "
+                        f"val_loss_dolp={val_metrics['loss_dolp']:.6f} | "
+                        f"val_loss_aolp={val_metrics['loss_aolp']:.6f}"
+                    )
                 append_log(log_path, message)
+
+                # Clean discipline: best_val.pth is selected by the val split.
+                # best.pth (train loss) is kept for backward compatibility only.
+                if val_metrics is not None and val_metrics["loss"] < best_val_loss:
+                    best_val_loss = val_metrics["loss"]
+                    save_checkpoint(
+                        save_dir / "best_val.pth", epoch, model, optimizer, best_val_loss, args
+                    )
 
                 if metrics["loss"] < best_loss:
                     best_loss = metrics["loss"]

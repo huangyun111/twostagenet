@@ -20,6 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from datasets.manifest_dataset import Stage2ManifestDataset  # noqa: E402
 from datasets.stage2_residual_dataset import Stage2ResidualDataset  # noqa: E402
 from losses.stage2_angular_refiner_loss import Stage2AngularRefinerLoss  # noqa: E402
 from models.stage2_angular_refiner_net import ConfidenceGuidedAngularResidualRefiner  # noqa: E402
@@ -61,6 +62,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage1_dir", type=str, default="./stage1_exports")
     parser.add_argument("--val_root_dir", type=str, default=None)
     parser.add_argument("--val_stage1_dir", type=str, default=None)
+    parser.add_argument(
+        "--manifest",
+        type=str,
+        default="",
+        help="Path to assembly_manifest.json. When set, the 13168 clean-split "
+        "manifest is used; train=--split, val=--val_split, both reading Stage1 "
+        "exports from --stage1_dir. --root_dir/--val_* are ignored.",
+    )
+    parser.add_argument("--dataset_root", type=str, default="")
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="train",
+        choices=("train", "val", "test", "all"),
+    )
+    parser.add_argument(
+        "--val_split",
+        type=str,
+        default="val",
+        choices=("none", "train", "val", "test"),
+        help="Manifest split for val checkpoint selection ('none' disables).",
+    )
     parser.add_argument("--save_dir", type=str, default="./checkpoints_stage2_angular_refiner")
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument(
@@ -185,6 +208,42 @@ def build_val_dataloader(args: argparse.Namespace, device: torch.device) -> tupl
         distributed=False,
     )
     return dataloader, size
+
+
+def build_manifest_dataloader(
+    args: argparse.Namespace,
+    split: str,
+    augment: bool,
+    shuffle: bool,
+    max_samples: int | None,
+    pin_memory: bool,
+    distributed: bool,
+) -> tuple[DataLoader, int, DistributedSampler | None]:
+    dataset = Stage2ManifestDataset(
+        manifest_path=args.manifest,
+        stage1_dir=args.stage1_dir,
+        dataset_root=args.dataset_root or None,
+        split=split,
+        augment=augment,
+    )
+    if max_samples is not None:
+        if max_samples <= 0:
+            raise ValueError("max_samples must be positive or None.")
+        dataset = Subset(dataset, range(min(max_samples, len(dataset))))
+    sampler = (
+        DistributedSampler(dataset, shuffle=shuffle, drop_last=False)
+        if distributed
+        else None
+    )
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=shuffle and sampler is None,
+        sampler=sampler,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+    )
+    return dataloader, len(dataset), sampler
 
 
 def build_model(args: argparse.Namespace, device: torch.device) -> ConfidenceGuidedAngularResidualRefiner:
@@ -460,25 +519,48 @@ def main() -> None:
     barrier()
     log_path = save_dir / "train_log.txt"
 
-    train_loader, train_size, train_sampler = build_dataloader(
-        root_dir=args.root_dir,
-        stage1_dir=args.stage1_dir,
-        image_size=args.image_size,
-        preprocess_mode=args.preprocess_mode,
-        crop_size=args.crop_size,
-        normalize_mode=args.normalize_mode,
-        random_crop=args.preprocess_mode == "official_train",
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        shuffle=True,
-        max_samples=args.max_train_samples,
-        pin_memory=device.type == "cuda",
-        distributed=distributed,
-    )
-    if is_main_process():
-        val_loader, val_size = build_val_dataloader(args, device)
+    if args.manifest:
+        train_loader, train_size, train_sampler = build_manifest_dataloader(
+            args,
+            split=args.split,
+            augment=True,
+            shuffle=True,
+            max_samples=args.max_train_samples,
+            pin_memory=device.type == "cuda",
+            distributed=distributed,
+        )
+        if is_main_process() and args.val_split != "none":
+            val_loader, val_size, _ = build_manifest_dataloader(
+                args,
+                split=args.val_split,
+                augment=False,
+                shuffle=False,
+                max_samples=args.max_val_samples,
+                pin_memory=device.type == "cuda",
+                distributed=False,
+            )
+        else:
+            val_loader, val_size = None, 0
     else:
-        val_loader, val_size = None, 0
+        train_loader, train_size, train_sampler = build_dataloader(
+            root_dir=args.root_dir,
+            stage1_dir=args.stage1_dir,
+            image_size=args.image_size,
+            preprocess_mode=args.preprocess_mode,
+            crop_size=args.crop_size,
+            normalize_mode=args.normalize_mode,
+            random_crop=args.preprocess_mode == "official_train",
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            shuffle=True,
+            max_samples=args.max_train_samples,
+            pin_memory=device.type == "cuda",
+            distributed=distributed,
+        )
+        if is_main_process():
+            val_loader, val_size = build_val_dataloader(args, device)
+        else:
+            val_loader, val_size = None, 0
 
     model = build_model(args, device)
     loss_fn = Stage2AngularRefinerLoss().to(device)
