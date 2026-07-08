@@ -1,0 +1,2 @@
+Start training on cuda, samples=1133, batch_size=4, lrs=1.00e-05,1.00e-04
+epoch 1/20 | loss=0.203969 | loss_dolp=0.019227 | loss_aolp=0.162003 | loss_unc=-0.725077 | loss_lowfreq=0.412272 | loss_edge=0.255835 | lr=1.00e-05,1.00e-04
