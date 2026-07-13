@@ -129,3 +129,18 @@ The running-training instructions below were completed and are superseded by the
 - Local result package: `results_hammer_vd/`.
 - Remote formal output: `/home/hy/twostage/stage2_reliability_gated_restormer_vd_hammer_test_outputs`.
 - Result figure: `results_hammer_vd/hammer_vd_formal_results.png`.
+
+## Version E Asymmetric DoLP Refiner (2026-07-13)
+
+- Version D remains untouched and recoverable.
+- Version E keeps the Version D circular AoLP residual and angle gate.
+- DoLP now uses a zero-initialized ungated residual, a dedicated prior stem,
+  channel-specific confidence guidance, and a light high-resolution adapter.
+- DoLP is trained with scale-normalized Charbonnier loss plus direct residual
+  supervision; DoLP no-harm and gate penalties are intentionally absent.
+- Model: `models/stage2_asymmetric_restormer_refiner.py`.
+- Loss: `losses/stage2_asymmetric_restormer_loss.py`.
+- Online HAMMER trainer: `train_stage2_asymmetric_restormer_online_stage1.py`.
+- Launcher: `scripts/run_stage2_asymmetric_restormer_hammer_train.sh`.
+- Formal selection remains validation-only. Do not run HAMMER test while
+  Version E is still being developed or selected.
