@@ -1,0 +1,38 @@
+[launch] Version D HAMMER test with 5 shards: 1,2,3,4,5
+[launch] checkpoint=/home/hy/twostage/checkpoints_stage2_reliability_gated_restormer_vd_hammer/best_val.pth
+[launch] output=/home/hy/twostage/stage2_reliability_gated_restormer_vd_hammer_test_outputs
+{
+  "architecture_version": "D",
+  "checkpoint": "/home/hy/twostage/checkpoints_stage2_reliability_gated_restormer_vd_hammer/best_val.pth",
+  "model_type": "stage2_reliability_gated_restormer_refiner_vd",
+  "num_shards": 5,
+  "resize_output_to_gt": false,
+  "root_dir": "/home/hy/Documents/HAMMER_twostage/test",
+  "samples": 1414,
+  "stage1_aop_mae_deg": 44.282212604053285,
+  "stage1_cos_mae": 0.9315162426680116,
+  "stage1_cos_sin_vector_error": 1.2677861033099713,
+  "stage1_dir": "/home/hy/twostage/stage1_exports_13168_hammer_lowfreq_x4",
+  "stage1_dolp_mae": 0.07729487896724334,
+  "stage1_dolp_rmse": 0.12429723488180101,
+  "stage1_dop_mae": 0.07729487896724334,
+  "stage1_dop_rmse": 0.12429723488180101,
+  "stage1_high_dolp_aolp_error_deg": 36.67086141686123,
+  "stage1_high_dop_aop_mae_deg": 36.67086141686123,
+  "stage1_sin_mae": 0.6944447068294676,
+  "stage1_weighted_aolp_error_deg": 40.00984666033884,
+  "stage1_weighted_aop_mae_deg": 40.00984666033884,
+  "stage2_aop_mae_deg": 28.877120262156787,
+  "stage2_cos_mae": 0.5819496822660681,
+  "stage2_cos_sin_vector_error": 0.8677701934055021,
+  "stage2_dolp_mae": 0.07729487154564307,
+  "stage2_dolp_rmse": 0.12429722545001935,
+  "stage2_dop_mae": 0.07729487154564307,
+  "stage2_dop_rmse": 0.12429722545001935,
+  "stage2_high_dolp_aolp_error_deg": 23.165394850465162,
+  "stage2_high_dop_aop_mae_deg": 23.165394850465162,
+  "stage2_sin_mae": 0.5223661628057799,
+  "stage2_weighted_aolp_error_deg": 24.565683008083358,
+  "stage2_weighted_aop_mae_deg": 24.565683008083358
+}
+[done] Version D HAMMER multi-GPU test complete

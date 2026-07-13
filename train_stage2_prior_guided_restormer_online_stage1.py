@@ -58,6 +58,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_freq", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument(
+        "--data_parallel",
+        action="store_true",
+        help="Wrap the frozen Stage1 and trainable Stage2 models in nn.DataParallel.",
+    )
     return parser.parse_args()
 
 
@@ -106,6 +111,10 @@ def build_stage1(checkpoint_path: str, device: torch.device) -> PolarPriorNet:
     for parameter in model.parameters():
         parameter.requires_grad_(False)
     return model
+
+
+def unwrap_model(model: nn.Module) -> nn.Module:
+    return model.module if isinstance(model, nn.DataParallel) else model
 
 
 def lowpass(tensor: torch.Tensor, factor: int) -> torch.Tensor:
@@ -187,7 +196,7 @@ def save_checkpoint(
     torch.save(
         {
             "epoch": epoch,
-            "model": model.state_dict(),
+            "model": unwrap_model(model).state_dict(),
             "optimizer": optimizer.state_dict(),
             "best_val_loss": best_val_loss,
             "args": vars(args),
@@ -206,7 +215,7 @@ def load_checkpoint(
 ) -> tuple[int, float]:
     checkpoint = torch.load(path, map_location=device)
     state_dict = checkpoint.get("model", checkpoint.get("model_state_dict", checkpoint))
-    model.load_state_dict(strip_module_prefix(state_dict))
+    unwrap_model(model).load_state_dict(strip_module_prefix(state_dict))
     optimizer_state = checkpoint.get("optimizer")
     if optimizer_state is not None:
         optimizer.load_state_dict(optimizer_state)
@@ -243,8 +252,12 @@ def main() -> None:
         pin_memory=device.type == "cuda",
     )
 
-    stage1 = build_stage1(args.stage1_checkpoint, device)
-    stage2 = build_stage2(args, device)
+    stage1: nn.Module = build_stage1(args.stage1_checkpoint, device)
+    stage2: nn.Module = build_stage2(args, device)
+    use_data_parallel = args.data_parallel and device.type == "cuda" and torch.cuda.device_count() > 1
+    if use_data_parallel:
+        stage1 = nn.DataParallel(stage1)
+        stage2 = nn.DataParallel(stage2)
     optimizer = torch.optim.AdamW(stage2.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     loss_fn = Stage2PriorGuidedRestormerLoss(
         residual_scale=args.residual_scale,
@@ -259,6 +272,7 @@ def main() -> None:
     append_log(
         log_path,
         f"[config] train={len(train_dataset)} val={len(val_dataset)} batch_size={args.batch_size} "
+        f"data_parallel={use_data_parallel} visible_gpus={torch.cuda.device_count()} "
         f"stage1_checkpoint={args.stage1_checkpoint} weak_factor={args.weak_factor} "
         f"confidence_scale={args.confidence_scale} dim={args.dim} num_blocks={args.num_blocks}",
     )

@@ -74,6 +74,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--residual_scale", type=float, default=0.5)
     parser.add_argument("--angle_residual_scale", type=float, default=math.pi / 2.0)
     parser.add_argument("--min_gate", type=float, default=0.05)
+    parser.add_argument("--num_shards", type=int, default=1)
+    parser.add_argument("--shard_index", type=int, default=0)
     return parser.parse_args()
 
 
@@ -99,6 +101,17 @@ def build_dataset(args: argparse.Namespace) -> Stage2ManifestDataset | Stage2Res
         if args.max_samples <= 0:
             raise ValueError("max_samples must be positive or None.")
         dataset = Subset(dataset, range(min(args.max_samples, len(dataset))))
+    if args.num_shards < 1:
+        raise ValueError("--num_shards must be >= 1")
+    if args.shard_index < 0 or args.shard_index >= args.num_shards:
+        raise ValueError("--shard_index must be in [0, num_shards)")
+    if args.num_shards > 1:
+        shard_indices = list(range(args.shard_index, len(dataset), args.num_shards))
+        dataset = Subset(dataset, shard_indices)
+        print(
+            f"running shard {args.shard_index + 1}/{args.num_shards}: {len(dataset)} samples",
+            flush=True,
+        )
     return dataset
 
 
@@ -227,6 +240,8 @@ def main() -> None:
         "manifest": args.manifest,
         "resize_output_to_gt": args.resize_output_to_gt,
         "output_resized_to_gt_count": resized_count,
+        "num_shards": args.num_shards,
+        "shard_index": args.shard_index,
         **summary,
     }
     (output_dir / "summary.json").write_text(

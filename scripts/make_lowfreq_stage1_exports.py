@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +19,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", type=Path, required=True)
     parser.add_argument("--factor", type=int, default=4)
     parser.add_argument("--confidence_scale", type=float, default=0.5)
+    parser.add_argument("--num_workers", type=int, default=1)
+    parser.add_argument("--skip_existing", action="store_true")
     return parser.parse_args()
 
 
@@ -63,6 +66,20 @@ def process_export_pair(
     np.save(output_confidence_dir / confidence_path.name, coarse_confidence.astype(np.float32))
 
 
+def process_task(task: tuple[Path, Path, Path, Path, int, float]) -> str:
+    torch.set_num_threads(1)
+    prior_path, confidence_path, output_prior_dir, output_confidence_dir, factor, confidence_scale = task
+    process_export_pair(
+        prior_path=prior_path,
+        confidence_path=confidence_path,
+        output_prior_dir=output_prior_dir,
+        output_confidence_dir=output_confidence_dir,
+        factor=factor,
+        confidence_scale=confidence_scale,
+    )
+    return prior_path.name
+
+
 def main() -> None:
     args = parse_args()
     input_prior_dir = args.input_dir / "prior_npy"
@@ -73,23 +90,41 @@ def main() -> None:
         raise FileNotFoundError(input_prior_dir)
     if not input_confidence_dir.is_dir():
         raise FileNotFoundError(input_confidence_dir)
-    count = 0
+    tasks: list[tuple[Path, Path, Path, Path, int, float]] = []
+    skipped = 0
     for prior_path in sorted(input_prior_dir.glob("*.npy")):
         confidence_path = input_confidence_dir / prior_path.name
         if not confidence_path.is_file():
             raise FileNotFoundError(confidence_path)
-        process_export_pair(
-            prior_path=prior_path,
-            confidence_path=confidence_path,
-            output_prior_dir=output_prior_dir,
-            output_confidence_dir=output_confidence_dir,
-            factor=args.factor,
-            confidence_scale=args.confidence_scale,
+        output_prior_path = output_prior_dir / prior_path.name
+        output_confidence_path = output_confidence_dir / confidence_path.name
+        if args.skip_existing and output_prior_path.is_file() and output_confidence_path.is_file():
+            skipped += 1
+            continue
+        tasks.append(
+            (
+                prior_path,
+                confidence_path,
+                output_prior_dir,
+                output_confidence_dir,
+                args.factor,
+                args.confidence_scale,
+            )
         )
-        count += 1
+    if args.num_workers <= 0:
+        raise ValueError("num_workers must be positive.")
+    if args.num_workers == 1:
+        for task in tasks:
+            process_task(task)
+    else:
+        with ProcessPoolExecutor(max_workers=args.num_workers) as executor:
+            for _ in executor.map(process_task, tasks, chunksize=1):
+                pass
+    count = skipped + len(tasks)
     print(
         f"wrote {count} coarse Stage1 exports to {args.output_dir} "
-        f"(factor={args.factor}, confidence_scale={args.confidence_scale})",
+        f"(factor={args.factor}, confidence_scale={args.confidence_scale}, "
+        f"workers={args.num_workers}, skipped={skipped})",
         flush=True,
     )
 

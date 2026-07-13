@@ -101,3 +101,31 @@ Start with available GPUs only. Run a safe batch probe and raise `BATCH_SIZE` wh
 - Stage2 must not show the previous cross-domain pattern where it worsens Stage1.
 - Select `best_val.pth` using validation only.
 - Test inference happens once after architecture and checkpoint selection are frozen.
+
+## Running HAMMER Retrain (2026-07-13)
+
+- Deployment root: `/home/hy/twostage` on `dl_server_114` (`hy@100.76.211.27`). The dirty historical `/home/hy/twostagenet` worktree was preserved.
+- Online Stage1 Version D training now supports `nn.DataParallel` for both the frozen Stage1 and trainable Stage2 models.
+- HAMMER split sizes verified: train `5253`, val `540`, test `1414`.
+- Direct U-Net++-aligned settings: crop `512`, `image_max`, `80` epochs, AdamW, LR `1e-4`, weight decay `1e-4`, workers `4`, seed `42`.
+- GPU policy: GPUs `0` and `6` belong to other jobs and must not be touched; training uses `1,2,3,4,5`; GPU `7` stays free.
+- Stable formal batch: total batch `10` (2 samples/GPU), about `21.4-21.7 GiB` per training GPU.
+- Required 20-sample overfit gate passed. Train loss fell `1.825054 -> 1.200195`; all diagnostics were finite. On the same 20 train samples, coarse-to-refined metrics changed: DoLP MAE `0.07277660 -> 0.07124497`, vector L1 `0.73827407 -> 0.51965080`, weighted AoLP `30.28504620 -> 19.29228144` degrees. Mean gates were DoLP `0.37254880`, angle `0.56047592`.
+- Formal tmux session: `vd_hammer_formal`.
+- Formal checkpoint dir: `/home/hy/twostage/checkpoints_stage2_reliability_gated_restormer_vd_hammer`.
+- Combined train/test log: `/home/hy/twostage/stage2_reliability_gated_restormer_vd_hammer_train_test.log`.
+- Launcher: `scripts/run_stage2_prior_guided_restormer_hammer_train_test.sh`. It trains on HAMMER, selects `best_val.pth` using validation only, builds the frozen Stage1 low-frequency test priors, then runs the one-time HAMMER test automatically.
+
+The running-training instructions below were completed and are superseded by the formal-test section that follows.
+
+## HAMMER Formal Test Complete (2026-07-13)
+
+- Training was early-stopped after epoch 57 because epoch 40 remained best for 17 consecutive completed epochs.
+- Formal checkpoint: epoch 40 `best_val.pth`, validation loss `2.071533`.
+- Formal HAMMER test completed once on all 1414 frozen test frames, sharded over the then-free GPUs `1,2,3,4,5`. GPUs `0,6,7` belonged to other jobs and were not touched.
+- Merged Version D metrics: DoLP MAE `0.07729487`, RMSE `0.12429723`, vector `0.86777019`, weighted AoLP `24.565683°`, high-DoLP AoLP `23.165395°`.
+- Same-protocol Direct U-Net++ comparison: `0.05849019`, `0.09426134`, `0.87368246`, `24.951095°`, `23.610723°`.
+- Interpretation: Version D is slightly better on vector/AoLP but clearly worse on DoLP. Do not claim blanket superiority.
+- Local result package: `results_hammer_vd/`.
+- Remote formal output: `/home/hy/twostage/stage2_reliability_gated_restormer_vd_hammer_test_outputs`.
+- Result figure: `results_hammer_vd/hammer_vd_formal_results.png`.
