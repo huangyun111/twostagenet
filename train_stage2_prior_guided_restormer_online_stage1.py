@@ -1,4 +1,4 @@
-"""Train Version C with an online frozen weak Stage1 prior."""
+"""Train Version D with an online frozen low-frequency Stage1 prior."""
 
 from __future__ import annotations
 
@@ -23,11 +23,17 @@ from train_stage2_prior_guided_restormer import METRIC_KEYS, average_metrics, pa
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train Version C with online weak Stage1.")
+    parser = argparse.ArgumentParser(
+        description="Train Version D with online low-frequency Stage1 guidance."
+    )
     parser.add_argument("--root_dir", type=str, required=True)
     parser.add_argument("--val_root_dir", type=str, required=True)
     parser.add_argument("--stage1_checkpoint", type=str, required=True)
-    parser.add_argument("--save_dir", type=str, default="./checkpoints_stage2_prior_guided_restormer_online_stage1")
+    parser.add_argument(
+        "--save_dir",
+        type=str,
+        default="./checkpoints_stage2_reliability_gated_restormer_vd_online_stage1",
+    )
     parser.add_argument("--preprocess_mode", choices=("resize256", "official_train"), default="official_train")
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--crop_size", type=int, default=512)
@@ -42,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_heads", type=lambda value: parse_int_tuple(value, 3), default=(1, 2, 4))
     parser.add_argument("--ffn_expansion", type=float, default=2.66)
     parser.add_argument("--residual_scale", type=float, default=0.5)
-    parser.add_argument("--angle_residual_scale", type=float, default=math.pi)
+    parser.add_argument("--angle_residual_scale", type=float, default=math.pi / 2.0)
     parser.add_argument("--min_gate", type=float, default=0.05)
     parser.add_argument("--weak_factor", type=int, default=4)
     parser.add_argument("--confidence_scale", type=float, default=0.5)
@@ -185,7 +191,8 @@ def save_checkpoint(
             "optimizer": optimizer.state_dict(),
             "best_val_loss": best_val_loss,
             "args": vars(args),
-            "model_type": "stage2_prior_guided_restormer_refiner_online_stage1",
+            "model_type": "stage2_reliability_gated_restormer_refiner_vd_online_stage1",
+            "architecture_version": "D",
         },
         path,
     )
@@ -239,7 +246,10 @@ def main() -> None:
     stage1 = build_stage1(args.stage1_checkpoint, device)
     stage2 = build_stage2(args, device)
     optimizer = torch.optim.AdamW(stage2.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    loss_fn = Stage2PriorGuidedRestormerLoss().to(device)
+    loss_fn = Stage2PriorGuidedRestormerLoss(
+        residual_scale=args.residual_scale,
+        angle_residual_scale=args.angle_residual_scale,
+    ).to(device)
 
     start_epoch = 1
     best_val_loss = float("inf")

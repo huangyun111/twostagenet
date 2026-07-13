@@ -19,6 +19,9 @@ class Stage2PriorGuidedRestormerLoss(nn.Module):
         lambda_edge: float = 0.2,
         lambda_residual_reg: float = 0.02,
         lambda_gate_reg: float = 0.01,
+        lambda_no_harm: float = 0.2,
+        residual_scale: float = 0.5,
+        angle_residual_scale: float = math.pi / 2.0,
         dolp_low: float = 0.03,
         dolp_high: float = 0.15,
         eps: float = 1e-6,
@@ -31,6 +34,9 @@ class Stage2PriorGuidedRestormerLoss(nn.Module):
         self.lambda_edge = lambda_edge
         self.lambda_residual_reg = lambda_residual_reg
         self.lambda_gate_reg = lambda_gate_reg
+        self.lambda_no_harm = lambda_no_harm
+        self.residual_scale = residual_scale
+        self.angle_residual_scale = angle_residual_scale
         self.dolp_low = dolp_low
         self.dolp_high = dolp_high
         self.eps = eps
@@ -58,9 +64,38 @@ class Stage2PriorGuidedRestormerLoss(nn.Module):
         high_mask = (target[:, 0:1] > self.dolp_high).to(target.dtype)
         loss_high_dolp_aolp = self._weighted_mean(aolp_error, high_mask)
 
-        loss_edge = self._edge_loss(refined, target)
-        loss_residual_reg = pred["delta_dolp"].abs().mean() + pred["delta_angle"].abs().mean()
-        loss_gate_reg = (pred["refinement_gate"] * confidence.mean(dim=1, keepdim=True)).mean()
+        loss_edge_dolp, loss_edge_angle = self._edge_loss(refined, target, reliability)
+        loss_edge = loss_edge_dolp + loss_edge_angle
+        loss_residual_reg = (
+            pred["delta_dolp"].abs().mean() / max(self.residual_scale, self.eps)
+            + pred["delta_angle"].abs().mean() / max(self.angle_residual_scale, self.eps)
+        )
+        confidence_dolp = confidence[:, 0:1].clamp(0.0, 1.0)
+        confidence_angle = confidence[:, 1:3].mean(dim=1, keepdim=True).clamp(0.0, 1.0)
+        gate_dolp = pred["gate_dolp"] if "gate_dolp" in pred else pred["refinement_gate"]
+        gate_angle = pred["gate_angle"] if "gate_angle" in pred else pred["refinement_gate"]
+        normalized_delta_dolp = pred["delta_dolp"].abs() / max(self.residual_scale, self.eps)
+        normalized_delta_angle = pred["delta_angle"].abs() / max(
+            self.angle_residual_scale,
+            self.eps,
+        )
+        loss_gate_reg = 0.5 * (
+            (gate_dolp * confidence_dolp * normalized_delta_dolp).mean()
+            + self._weighted_mean(
+                gate_angle * confidence_angle * normalized_delta_angle,
+                reliability,
+            )
+        )
+
+        prior_dolp_error = (prior[:, 0:1] - target[:, 0:1]).abs()
+        refined_dolp_error = (refined[:, 0:1] - target[:, 0:1]).abs()
+        loss_no_harm_dolp = F.relu(refined_dolp_error - prior_dolp_error).mean()
+        prior_aolp_error = self._aolp_error_rad(prior, target)
+        loss_no_harm_angle = self._weighted_mean(
+            F.relu(aolp_error - prior_aolp_error),
+            reliability,
+        )
+        loss_no_harm = loss_no_harm_dolp + loss_no_harm_angle
 
         total = (
             self.lambda_dolp * loss_dolp
@@ -70,6 +105,7 @@ class Stage2PriorGuidedRestormerLoss(nn.Module):
             + self.lambda_edge * loss_edge
             + self.lambda_residual_reg * loss_residual_reg
             + self.lambda_gate_reg * loss_gate_reg
+            + self.lambda_no_harm * loss_no_harm
         )
 
         return {
@@ -79,9 +115,14 @@ class Stage2PriorGuidedRestormerLoss(nn.Module):
             "loss_aolp": loss_aolp.detach(),
             "loss_high_dolp_aolp": loss_high_dolp_aolp.detach(),
             "loss_edge": loss_edge.detach(),
+            "loss_edge_dolp": loss_edge_dolp.detach(),
+            "loss_edge_angle": loss_edge_angle.detach(),
             "loss_residual_reg": loss_residual_reg.detach(),
             "loss_gate_reg": loss_gate_reg.detach(),
+            "loss_no_harm": loss_no_harm.detach(),
             "mean_refinement_gate": pred["refinement_gate"].mean().detach(),
+            "mean_gate_dolp": gate_dolp.mean().detach(),
+            "mean_gate_angle": gate_angle.mean().detach(),
             "mean_abs_delta_dolp": pred["delta_dolp"].abs().mean().detach(),
             "mean_abs_delta_angle_deg": (
                 pred["delta_angle"].abs().mean() * (180.0 / math.pi)
@@ -106,10 +147,28 @@ class Stage2PriorGuidedRestormerLoss(nn.Module):
         cross = pred[:, 2:3] * target[:, 1:2] - pred[:, 1:2] * target[:, 2:3]
         return 0.5 * torch.atan2(cross.abs(), dot).abs()
 
-    @staticmethod
-    def _edge_loss(refined: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def _edge_loss(
+        self,
+        refined: torch.Tensor,
+        target: torch.Tensor,
+        reliability: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         refined_dx = refined[..., :, 1:] - refined[..., :, :-1]
         target_dx = target[..., :, 1:] - target[..., :, :-1]
         refined_dy = refined[..., 1:, :] - refined[..., :-1, :]
         target_dy = target[..., 1:, :] - target[..., :-1, :]
-        return F.l1_loss(refined_dx, target_dx) + F.l1_loss(refined_dy, target_dy)
+
+        dolp_edge = F.l1_loss(refined_dx[:, 0:1], target_dx[:, 0:1])
+        dolp_edge = dolp_edge + F.l1_loss(refined_dy[:, 0:1], target_dy[:, 0:1])
+
+        reliability_dx = torch.minimum(reliability[..., :, 1:], reliability[..., :, :-1])
+        reliability_dy = torch.minimum(reliability[..., 1:, :], reliability[..., :-1, :])
+        angle_edge = self._weighted_mean(
+            (refined_dx[:, 1:3] - target_dx[:, 1:3]).abs(),
+            reliability_dx,
+        )
+        angle_edge = angle_edge + self._weighted_mean(
+            (refined_dy[:, 1:3] - target_dy[:, 1:3]).abs(),
+            reliability_dy,
+        )
+        return dolp_edge, angle_edge

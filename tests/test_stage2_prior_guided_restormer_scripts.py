@@ -14,14 +14,14 @@ import train_stage2_prior_guided_restormer as train_script  # noqa: E402
 
 
 class Stage2PriorGuidedRestormerScriptsTest(unittest.TestCase):
-    def test_train_build_model_uses_version_c_model(self) -> None:
+    def test_train_build_model_uses_version_d_model(self) -> None:
         args = argparse.Namespace(
             dim=8,
             num_blocks=(1, 1, 1),
             num_heads=(1, 2, 4),
             ffn_expansion=2.0,
             residual_scale=0.5,
-            angle_residual_scale=3.141592653589793,
+            angle_residual_scale=1.5707963267948966,
             min_gate=0.05,
         )
 

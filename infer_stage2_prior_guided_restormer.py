@@ -1,4 +1,4 @@
-"""Infer Version C prior-guided Restormer Stage 2 refiner."""
+"""Infer Version D reliability-gated Restormer Stage 2 refiner."""
 
 from __future__ import annotations
 
@@ -44,7 +44,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset_root", type=str, default="")
     parser.add_argument("--split", choices=("train", "val", "test", "all"), default="test")
     parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--output_dir", type=str, default="./stage2_prior_guided_restormer_outputs")
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="./stage2_reliability_gated_restormer_vd_outputs",
+    )
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument(
         "--preprocess_mode",
@@ -68,7 +72,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_heads", type=lambda value: parse_int_tuple(value, 3), default=(1, 2, 4))
     parser.add_argument("--ffn_expansion", type=float, default=2.66)
     parser.add_argument("--residual_scale", type=float, default=0.5)
-    parser.add_argument("--angle_residual_scale", type=float, default=math.pi)
+    parser.add_argument("--angle_residual_scale", type=float, default=math.pi / 2.0)
     parser.add_argument("--min_gate", type=float, default=0.05)
     return parser.parse_args()
 
@@ -214,7 +218,8 @@ def main() -> None:
     write_metrics_csv(output_dir / "metrics.csv", rows)
     summary = summarize_rows(rows)
     payload = {
-        "model_type": "stage2_prior_guided_restormer_refiner",
+        "model_type": "stage2_reliability_gated_restormer_refiner_vd",
+        "architecture_version": "D",
         "samples": len(rows),
         "checkpoint": args.checkpoint,
         "stage1_dir": args.stage1_dir,

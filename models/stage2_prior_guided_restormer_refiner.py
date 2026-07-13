@@ -12,11 +12,12 @@ from models.direct_restormer_baseline import Downsample, Upsample, make_blocks
 
 
 class Stage2PriorGuidedRestormerRefiner(nn.Module):
-    """Version C: refine a coarse polarization prior with a Restormer backbone.
+    """Version D: reliability-gated coarse-to-fine polarization refinement.
 
-    The network consumes image evidence, Stage1 prior, and Stage1 confidence.
-    It predicts explicit DoLP and AoLP residuals plus a single refinement gate,
-    then fuses the residual-updated candidate with the original prior.
+    RGB, prior, and confidence use separate stems. The prior is injected at all
+    three Restormer scales through confidence-guided feature modulation. Output
+    refinement uses independent DoLP/AoLP gates and applies the AoLP residual
+    directly on the circular angle manifold.
     """
 
     def __init__(
@@ -29,7 +30,7 @@ class Stage2PriorGuidedRestormerRefiner(nn.Module):
         num_heads: tuple[int, int, int] = (1, 2, 4),
         expansion: float = 2.66,
         residual_scale: float = 0.5,
-        angle_residual_scale: float = math.pi,
+        angle_residual_scale: float = math.pi / 2.0,
         min_gate: float = 0.05,
         eps: float = 1e-6,
     ) -> None:
@@ -38,6 +39,8 @@ class Stage2PriorGuidedRestormerRefiner(nn.Module):
             raise ValueError("num_blocks and num_heads must each have 3 entries.")
         if dim <= 0:
             raise ValueError("dim must be positive.")
+        if residual_scale <= 0.0 or angle_residual_scale <= 0.0:
+            raise ValueError("residual scales must be positive.")
         if not 0.0 <= min_gate <= 1.0:
             raise ValueError("min_gate must be in [0, 1].")
         if eps <= 0.0:
@@ -47,9 +50,22 @@ class Stage2PriorGuidedRestormerRefiner(nn.Module):
         self.angle_residual_scale = angle_residual_scale
         self.min_gate = min_gate
         self.eps = eps
-        in_channels = in_channels_rgb + in_channels_prior + in_channels_confidence
+        self.rgb_stem = nn.Conv2d(in_channels_rgb, dim, kernel_size=3, padding=1)
+        self.prior_stem = nn.Conv2d(in_channels_prior, dim, kernel_size=3, padding=1)
+        self.confidence_stem = nn.Conv2d(
+            in_channels_confidence,
+            dim,
+            kernel_size=3,
+            padding=1,
+        )
+        self.prior_down1 = Downsample(dim)
+        self.prior_down2 = Downsample(dim * 2)
+        self.confidence_down1 = Downsample(dim)
+        self.confidence_down2 = Downsample(dim * 2)
+        self.guidance_gate1 = nn.Conv2d(dim, dim, kernel_size=1)
+        self.guidance_gate2 = nn.Conv2d(dim * 2, dim * 2, kernel_size=1)
+        self.guidance_gate3 = nn.Conv2d(dim * 4, dim * 4, kernel_size=1)
 
-        self.patch_embed = nn.Conv2d(in_channels, dim, kernel_size=3, padding=1)
         self.encoder1 = make_blocks(dim, num_blocks[0], num_heads[0], expansion)
         self.down1 = Downsample(dim)
         self.encoder2 = make_blocks(dim * 2, num_blocks[1], num_heads[1], expansion)
@@ -65,7 +81,17 @@ class Stage2PriorGuidedRestormerRefiner(nn.Module):
 
         self.delta_dolp_head = nn.Conv2d(dim, 1, kernel_size=3, padding=1)
         self.delta_angle_head = nn.Conv2d(dim, 1, kernel_size=3, padding=1)
-        self.gate_head = nn.Conv2d(dim, 1, kernel_size=3, padding=1)
+        self.gate_dolp_head = nn.Conv2d(dim, 1, kernel_size=3, padding=1)
+        self.gate_angle_head = nn.Conv2d(dim, 1, kernel_size=3, padding=1)
+
+        for layer in (self.guidance_gate1, self.guidance_gate2, self.guidance_gate3):
+            self._zero_init(layer)
+        # The initial network is exactly the Stage1 identity mapping. This keeps
+        # a newly initialized refiner from damaging a useful prior.
+        self._zero_init(self.delta_dolp_head)
+        self._zero_init(self.delta_angle_head)
+        self._zero_init(self.gate_dolp_head)
+        self._zero_init(self.gate_angle_head)
 
     def forward(
         self,
@@ -76,10 +102,39 @@ class Stage2PriorGuidedRestormerRefiner(nn.Module):
         height, width = rgb.shape[-2:]
         rgb, prior, confidence = self._pad_inputs(rgb, prior, confidence)
 
-        x = torch.cat([rgb, prior, confidence], dim=1)
-        x1 = self.encoder1(self.patch_embed(x))
-        x2 = self.encoder2(self.down1(x1))
-        latent = self.latent(self.down2(x2))
+        prior_reliability = confidence.mean(dim=1, keepdim=True).clamp(0.0, 1.0)
+        prior1 = self.prior_stem(prior)
+        confidence1 = self.confidence_stem(confidence)
+        x1 = self._guided_fusion(
+            self.rgb_stem(rgb),
+            prior1,
+            confidence1,
+            prior_reliability,
+            self.guidance_gate1,
+        )
+        x1 = self.encoder1(x1)
+
+        prior2 = self.prior_down1(prior1)
+        confidence2 = self.confidence_down1(confidence1)
+        x2 = self._guided_fusion(
+            self.down1(x1),
+            prior2,
+            confidence2,
+            prior_reliability,
+            self.guidance_gate2,
+        )
+        x2 = self.encoder2(x2)
+
+        prior3 = self.prior_down2(prior2)
+        confidence3 = self.confidence_down2(confidence2)
+        latent = self._guided_fusion(
+            self.down2(x2),
+            prior3,
+            confidence3,
+            prior_reliability,
+            self.guidance_gate3,
+        )
+        latent = self.latent(latent)
 
         y = self.up2(latent)
         y = self.decoder2(self.reduce2(torch.cat([y, x2], dim=1)))
@@ -94,11 +149,14 @@ class Stage2PriorGuidedRestormerRefiner(nn.Module):
         delta_dolp = self.residual_scale * torch.tanh(raw_delta_dolp)
         delta_angle = self.angle_residual_scale * torch.tanh(raw_delta_angle)
 
-        gate_logits = self.gate_head(y)
-        learned_gate = torch.sigmoid(gate_logits)
-        confidence_mean = confidence.mean(dim=1, keepdim=True).clamp(0.0, 1.0)
-        uncertainty_gate = self.min_gate + (1.0 - self.min_gate) * (1.0 - confidence_mean)
-        refinement_gate = learned_gate * uncertainty_gate
+        gate_dolp_logits = self.gate_dolp_head(y)
+        gate_angle_logits = self.gate_angle_head(y)
+        confidence_dolp = confidence[:, 0:1].clamp(0.0, 1.0)
+        confidence_angle = confidence[:, 1:3].mean(dim=1, keepdim=True).clamp(0.0, 1.0)
+        demand_dolp = self.min_gate + (1.0 - self.min_gate) * (1.0 - confidence_dolp)
+        demand_angle = self.min_gate + (1.0 - self.min_gate) * (1.0 - confidence_angle)
+        gate_dolp = torch.sigmoid(gate_dolp_logits) * demand_dolp
+        gate_angle = torch.sigmoid(gate_angle_logits) * demand_angle
 
         candidate_dolp = torch.clamp(prior[:, 0:1] + delta_dolp, 0.0, 1.0)
         theta_prior = 0.5 * torch.atan2(prior[:, 2:3], prior[:, 1:2])
@@ -106,22 +164,50 @@ class Stage2PriorGuidedRestormerRefiner(nn.Module):
         candidate_cos = torch.cos(2.0 * theta_candidate)
         candidate_sin = torch.sin(2.0 * theta_candidate)
 
-        dolp = (1.0 - refinement_gate) * prior[:, 0:1] + refinement_gate * candidate_dolp
-        cos2 = (1.0 - refinement_gate) * prior[:, 1:2] + refinement_gate * candidate_cos
-        sin2 = (1.0 - refinement_gate) * prior[:, 2:3] + refinement_gate * candidate_sin
-        norm = torch.sqrt(cos2.square() + sin2.square() + self.eps)
-        refined = torch.cat([dolp.clamp(0.0, 1.0), cos2 / norm, sin2 / norm], dim=1)
+        dolp = torch.clamp(prior[:, 0:1] + gate_dolp * delta_dolp, 0.0, 1.0)
+        theta_final = theta_prior + gate_angle * delta_angle
+        cos2 = torch.cos(2.0 * theta_final)
+        sin2 = torch.sin(2.0 * theta_final)
+        refined = torch.cat([dolp, cos2, sin2], dim=1)
+        refinement_gate = 0.5 * (gate_dolp + gate_angle)
 
         return {
             "refined": refined.contiguous(),
             "candidate": torch.cat([candidate_dolp, candidate_cos, candidate_sin], dim=1).contiguous(),
             "delta_dolp": delta_dolp.contiguous(),
             "delta_angle": delta_angle.contiguous(),
+            "gate_dolp": gate_dolp.contiguous(),
+            "gate_angle": gate_angle.contiguous(),
             "refinement_gate": refinement_gate.contiguous(),
             "raw_delta_dolp": raw_delta_dolp.contiguous(),
             "raw_delta_angle": raw_delta_angle.contiguous(),
-            "gate_logits": gate_logits.contiguous(),
+            "gate_dolp_logits": gate_dolp_logits.contiguous(),
+            "gate_angle_logits": gate_angle_logits.contiguous(),
         }
+
+    @staticmethod
+    def _zero_init(layer: nn.Conv2d) -> None:
+        nn.init.zeros_(layer.weight)
+        if layer.bias is not None:
+            nn.init.zeros_(layer.bias)
+
+    @staticmethod
+    def _guided_fusion(
+        image_features: torch.Tensor,
+        prior_features: torch.Tensor,
+        confidence_features: torch.Tensor,
+        prior_reliability: torch.Tensor,
+        guidance_gate: nn.Conv2d,
+    ) -> torch.Tensor:
+        reliability = F.interpolate(
+            prior_reliability,
+            size=image_features.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        learned_scale = 2.0 * torch.sigmoid(guidance_gate(confidence_features))
+        modulation = (reliability * learned_scale).clamp(0.0, 1.0)
+        return image_features + modulation * prior_features
 
     @staticmethod
     def _pad_inputs(

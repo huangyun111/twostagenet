@@ -1,4 +1,4 @@
-"""Train Version C: prior-guided angular Restormer Stage 2 refiner."""
+"""Train Version D: reliability-gated angular Restormer Stage 2 refiner."""
 
 from __future__ import annotations
 
@@ -27,9 +27,14 @@ METRIC_KEYS = (
     "loss_aolp",
     "loss_high_dolp_aolp",
     "loss_edge",
+    "loss_edge_dolp",
+    "loss_edge_angle",
     "loss_residual_reg",
     "loss_gate_reg",
+    "loss_no_harm",
     "mean_refinement_gate",
+    "mean_gate_dolp",
+    "mean_gate_angle",
     "mean_abs_delta_dolp",
     "mean_abs_delta_angle_deg",
 )
@@ -60,7 +65,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset_root", type=str, default="")
     parser.add_argument("--split", choices=("train", "val"), default="train")
     parser.add_argument("--val_split", choices=("val", "none"), default="val")
-    parser.add_argument("--save_dir", type=str, default="./checkpoints_stage2_prior_guided_restormer")
+    parser.add_argument(
+        "--save_dir",
+        type=str,
+        default="./checkpoints_stage2_reliability_gated_restormer_vd",
+    )
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument(
         "--preprocess_mode",
@@ -83,7 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_heads", type=lambda value: parse_int_tuple(value, 3), default=(1, 2, 4))
     parser.add_argument("--ffn_expansion", type=float, default=2.66)
     parser.add_argument("--residual_scale", type=float, default=0.5)
-    parser.add_argument("--angle_residual_scale", type=float, default=math.pi)
+    parser.add_argument("--angle_residual_scale", type=float, default=math.pi / 2.0)
     parser.add_argument("--min_gate", type=float, default=0.05)
     parser.add_argument("--resume", type=str, default="")
     parser.add_argument("--max_train_samples", type=int, default=None)
@@ -185,7 +194,8 @@ def save_checkpoint(
             "optimizer": optimizer.state_dict(),
             "best_val_loss": best_val_loss,
             "args": vars(args),
-            "model_type": "stage2_prior_guided_restormer_refiner",
+            "model_type": "stage2_reliability_gated_restormer_refiner_vd",
+            "architecture_version": "D",
         },
         path,
     )
@@ -286,7 +296,10 @@ def main() -> None:
     if args.data_parallel and device.type == "cuda" and torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    loss_fn = Stage2PriorGuidedRestormerLoss().to(device)
+    loss_fn = Stage2PriorGuidedRestormerLoss(
+        residual_scale=args.residual_scale,
+        angle_residual_scale=args.angle_residual_scale,
+    ).to(device)
 
     start_epoch = 1
     best_val_loss = float("inf")
