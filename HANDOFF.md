@@ -144,3 +144,23 @@ The running-training instructions below were completed and are superseded by the
 - Launcher: `scripts/run_stage2_asymmetric_restormer_hammer_train.sh`.
 - Formal selection remains validation-only. Do not run HAMMER test while
   Version E is still being developed or selected.
+
+### Version E HAMMER run
+
+- GitHub `main` and branch `codex/version-e-asymmetric-dolp` contain the
+  implementation at commit `9b32e02`.
+- Server deployment root: `/home/hy/twostage`.
+- A 20-sample same-source overfit gate passed on GPUs `1,2,3,4,5`: train loss
+  fell `2.241383 -> 1.525252`, normalized DoLP loss fell
+  `0.288598 -> 0.205980`, and mean `|delta_dolp|` grew
+  `0.000606 -> 0.057633` instead of collapsing to zero.
+- Formal tmux session: `hammer_ve_formal`.
+- Formal config: HAMMER train `5253`, val `540`, crop `512`, total batch `10`,
+  `80` epochs, AdamW `1e-4`, five-way `DataParallel` on GPUs `1,2,3,4,5`.
+- GPUs `0,6,7` are occupied by another user and were not touched.
+- Formal checkpoint directory:
+  `/home/hy/twostage/checkpoints_stage2_asymmetric_restormer_ve_hammer`.
+- Formal launcher log:
+  `/home/hy/twostage/stage2_asymmetric_restormer_ve_hammer.launch.log`.
+- Do not run HAMMER test automatically when training finishes. Select the
+  candidate from validation logs first and discuss the final test separately.
