@@ -1,0 +1,21 @@
+{
+  "aop_mae_deg": 28.71260936256851,
+  "checkpoint": "/home/hy/twostage/checkpoints_direct_unetpp_13168_pretrained_hammer/best_val.pth",
+  "cos_mae": 0.5738653452089517,
+  "cos_sin_vector_error": 0.861844872146887,
+  "dolp_mae": 0.0576530152344299,
+  "dolp_rmse": 0.09238720291901427,
+  "dop_mae": 0.0576530152344299,
+  "dop_rmse": 0.09238720291901427,
+  "high_dolp_aolp_error_deg": 22.857024389749874,
+  "high_dop_aop_mae_deg": 22.857024389749874,
+  "model_type": "direct_unetpp_13168_pretrained_hammer_finetuned",
+  "num_shards": 3,
+  "output_resized_to_gt_count": 0,
+  "resize_output_to_gt": true,
+  "root_dir": "/home/hy/Documents/HAMMER_twostage/test",
+  "samples": 1414,
+  "sin_mae": 0.5324870241539819,
+  "weighted_aolp_error_deg": 24.326921065086353,
+  "weighted_aop_mae_deg": 24.326921065086353
+}

@@ -210,3 +210,21 @@ The running-training instructions below were completed and are superseded by the
   is roughly 6-6.5 hours from the 11:13 CST launch.
 - Trainer: `train_direct_unetpp_hammer_finetune.py`.
 - Launcher: `scripts/run_direct_unetpp_13168_pretrained_hammer_finetune.sh`.
+
+### Formal test result
+
+- At the user's request, training was stopped after epoch 75. The HAMMER
+  validation-selected checkpoint remained epoch 70 with loss `1.006718`.
+- The one-time frozen HAMMER test completed on all 1414 frames using the
+  then-free GPUs `0,5,6`; all other occupied GPUs were untouched.
+- The three shards contained 472/471/471 samples and merged into exactly 1414
+  unique metric rows. Output resizing was requested for protocol parity but no
+  frame actually required resizing.
+- Formal metrics: DoLP MAE `0.05765302`, RMSE `0.09238720`, vector
+  `0.86184487`, weighted AoLP `24.326921°`, high-DoLP AoLP `22.857024°`.
+- Against Version E, the pretrained Direct U-Net++ is lower on vector and
+  high-DoLP AoLP; Version E is lower on DoLP MAE, RMSE, and weighted AoLP.
+  Do not claim that either system wins all five metrics.
+- Local result package: `results_hammer_direct_unetpp_13168_pretrained/`.
+- Remote output:
+  `/home/hy/twostage/direct_unetpp_13168_pretrained_hammer_test_outputs`.
