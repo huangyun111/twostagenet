@@ -183,3 +183,27 @@ The running-training instructions below were completed and are superseded by the
 - Remote formal output:
   `/home/hy/twostage/stage2_asymmetric_restormer_ve_hammer_test_outputs`.
 - Result figure: `results_hammer_ve/hammer_ve_formal_results.png`.
+
+## Direct U-Net++ 13168 Pretraining -> HAMMER Fine-tuning (2026-07-14)
+
+- Purpose: match the extra 13168 pretraining information used by the frozen
+  Stage1 in Version E. The previous Direct U-Net++ HAMMER baseline started from
+  scratch and therefore was not a clean total-data comparison.
+- Initialization checkpoint:
+  `/home/hy/twostagenet/checkpoints_direct_unetpp_13168/best_val.pth`.
+- Fine-tuning loads model weights only. It intentionally resets optimizer,
+  epoch numbering, and HAMMER best-validation state.
+- HAMMER splits remain train `5253`, val `540`, frozen test `1414`. Test must
+  not run until training is complete and `best_val.pth` is selected using only
+  HAMMER validation loss.
+- Formal tmux session: `direct_unetpp_13168_pretrain_hammer`.
+- Formal GPUs: `5,6`; all other GPUs were occupied and left untouched.
+- Formal settings: crop `512`, `image_max`, total batch `20` (10/GPU), 80
+  epochs, AdamW, LR `1e-4`, encoder LR `1e-5`, weight decay `1e-4`, workers 4,
+  seed 42. A two-GPU probe reached about 19.4/18.8 GiB on GPUs 5/6 without OOM.
+- Formal checkpoint directory:
+  `/home/hy/twostage/checkpoints_direct_unetpp_13168_pretrained_hammer`.
+- Formal log:
+  `/home/hy/twostage/checkpoints_direct_unetpp_13168_pretrained_hammer/train.log`.
+- Trainer: `train_direct_unetpp_hammer_finetune.py`.
+- Launcher: `scripts/run_direct_unetpp_13168_pretrained_hammer_finetune.sh`.
