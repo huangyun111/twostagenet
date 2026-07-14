@@ -1,4 +1,9 @@
-"""Fine-tune a 13168-pretrained Direct NAFNet on HAMMER train/val splits."""
+"""Train Direct NAFNet on HAMMER train/val splits.
+
+Fresh end-to-end HAMMER training is the default. ``--init_checkpoint`` remains
+available for explicitly named transfer experiments, while ``--resume`` is
+only for continuing an interrupted run.
+"""
 
 from __future__ import annotations
 
@@ -29,12 +34,12 @@ from train_direct_unetpp_baseline import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Fine-tune a 13168-pretrained Direct NAFNet on HAMMER."
+        description="Train Direct NAFNet end-to-end on HAMMER train/val splits."
     )
     parser.add_argument("--root_dir", type=str, required=True)
     parser.add_argument("--val_root_dir", type=str, required=True)
     parser.add_argument("--save_dir", type=str, required=True)
-    source = parser.add_mutually_exclusive_group(required=True)
+    source = parser.add_mutually_exclusive_group(required=False)
     source.add_argument(
         "--init_checkpoint",
         type=str,
@@ -114,7 +119,7 @@ def main() -> None:
     set_seed(args.seed)
     device = resolve_device(args.device)
     save_dir = Path(args.save_dir)
-    if args.init_checkpoint and (save_dir / "last.pth").exists():
+    if not args.resume and (save_dir / "last.pth").exists():
         raise FileExistsError(
             f"Refusing to overwrite an existing run: {save_dir}. Use --resume to continue it."
         )
