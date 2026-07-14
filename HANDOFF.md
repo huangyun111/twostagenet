@@ -228,3 +228,46 @@ The running-training instructions below were completed and are superseded by the
 - Local result package: `results_hammer_direct_unetpp_13168_pretrained/`.
 - Remote output:
   `/home/hy/twostage/direct_unetpp_13168_pretrained_hammer_test_outputs`.
+
+## HAMMER low-data experiment running on AutoDL (2026-07-14)
+
+- New HAMMER-only fairness protocol: final scope is 25/50%. Each fraction trains its own Stage1 from the same nested seed-42 subset, then trains Version E on that subset. Direct U-Net++ sees exactly the same subset. Full fixed val=540 selects checkpoints; frozen test=1414 remains untouched until training is complete. The initial 10% partial was canceled/deleted and 100% was dropped by user decision.
+- Added `datasets/nested_subset.py`, fraction/subset manifest support in the Stage1, Version E, and HAMMER U-Net++ trainers, plus AutoDL sequential launchers:
+  - `scripts/run_hammer_lowdata_version_e_autodl.sh`
+  - `scripts/run_hammer_lowdata_unetpp_autodl.sh`
+- AutoDL tmux sessions: `hammer_lowdata_ve` and `hammer_lowdata_unetpp`.
+- Shared output: `/autodl-fs/data/hammer_lowdata/{version_e,direct_unetpp}`.
+- The canceled 10% probes proved Stage1 and Direct U-Net++ batch=32 stable near 95GB on RTX PRO 6000 96GB. Formal 25% uses 1313 train / 540 val; Version E Stage2 will use batch=8. New processes use max 80 epochs with val patience=15.
+- Old Version C formal metrics were preserved in `/autodl-fs/data/twostagenet_runs/evidence_archive`; only reproducible arrays/PNG/NPY intermediates were removed, freeing about 89GB.
+- Do not run HAMMER test or tune from test until both 25/50% fractions have val-selected checkpoints.
+
+## Direct NAFNet HAMMER End-to-End (2026-07-14)
+
+- This is a pure HAMMER experiment. It does **not** read the final_new512/13168
+  manifest and does **not** initialize from any 13168 checkpoint.
+- Protocol: random initialization -> HAMMER train (`5253`) -> HAMMER val
+  (`540`) selects `best_val.pth` -> the frozen HAMMER test (`1414`) runs once
+  with that validation-selected checkpoint.
+- Model: task-adapted official NAFNet-width32 using the SIDD block layout
+  (`enc=[2,2,4,8]`, `middle=12`, `dec=[2,2,2,2]`, 29.16M parameters). The
+  image-restoration global RGB residual is removed because RGB/S0 and the
+  polarization encoding have different semantics. The output uses the same
+  DoLP sigmoid and normalized cos/sin projection as the other Direct baselines.
+- GitHub `main` and `codex/version-e-asymmetric-dolp`: commit `baabecc`.
+- Server root: `/home/hy/twostage`; tmux session:
+  `direct_nafnet_hammer_e2e`.
+- Formal training uses the currently free GPUs `5,6`; GPUs `0-4,7` were
+  occupied and left untouched. Settings: crop `512`, `image_max`, total batch
+  `4` (2/GPU), workers `4`, 80 epochs, AdamW LR `1e-4`, weight decay `1e-4`,
+  seed `42`, full composite `DirectPolarLoss` for validation selection.
+- A batch-4 probe completed forward/backward/validation/checkpoint save and
+  peaked at about `16.9/16.7 GiB`. Batch 6 peaked at `24.3/24.1 GiB` in the
+  tiny probe and failed at cuDNN initialization in the formal full-data run,
+  so it was rejected as unsafe rather than used for training.
+- Formal checkpoint directory:
+  `/home/hy/twostage/checkpoints_direct_nafnet_hammer_e2e`.
+- Combined pipeline log:
+  `/home/hy/twostage/direct_nafnet_hammer_e2e.pipeline.log`.
+- After training finishes, `scripts/run_direct_nafnet_hammer_train_then_test.sh`
+  automatically uses `best_val.pth` for sharded test inference and writes:
+  `/home/hy/twostage/direct_nafnet_hammer_e2e_test_outputs`.
