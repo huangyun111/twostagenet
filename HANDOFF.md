@@ -205,5 +205,8 @@ The running-training instructions below were completed and are superseded by the
   `/home/hy/twostage/checkpoints_direct_unetpp_13168_pretrained_hammer`.
 - Formal log:
   `/home/hy/twostage/checkpoints_direct_unetpp_13168_pretrained_hammer/train.log`.
+- Stable-start evidence: epoch 1 completed in about 4m45s with validation loss
+  `1.122231` and became the initial HAMMER `best_val`. The observed full-run ETA
+  is roughly 6-6.5 hours from the 11:13 CST launch.
 - Trainer: `train_direct_unetpp_hammer_finetune.py`.
 - Launcher: `scripts/run_direct_unetpp_13168_pretrained_hammer_finetune.sh`.
