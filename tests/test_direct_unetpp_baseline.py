@@ -1,6 +1,7 @@
 import unittest
 from pathlib import Path
 import sys
+import tempfile
 
 import torch
 
@@ -10,6 +11,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from losses.direct_polar_loss import DirectPolarLoss
 from models.direct_unetpp_baseline import DirectUnetPlusPlusBaseline
+from train_direct_unetpp_hammer_finetune import load_weights_only
 
 
 class DirectUnetPlusPlusBaselineTest(unittest.TestCase):
@@ -61,6 +63,32 @@ class DirectUnetPlusPlusBaselineTest(unittest.TestCase):
         )
         self.assertTrue(bool(losses["loss"].requires_grad))
         self.assertGreater(float(losses["loss"]), 0.0)
+
+    def test_hammer_finetune_loads_pretrained_weights_without_training_state(self) -> None:
+        source = DirectUnetPlusPlusBaseline(encoder_name="resnet18")
+        target = DirectUnetPlusPlusBaseline(encoder_name="resnet18")
+        with torch.no_grad():
+            next(source.parameters()).fill_(0.125)
+            next(target.parameters()).zero_()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = Path(temp_dir) / "best_val.pth"
+            torch.save(
+                {
+                    "epoch": 37,
+                    "model": source.state_dict(),
+                    "optimizer": {"must_not_be_loaded": True},
+                    "best_val_loss": 0.25,
+                },
+                checkpoint_path,
+            )
+            metadata = load_weights_only(str(checkpoint_path), target, torch.device("cpu"))
+
+        self.assertTrue(
+            torch.equal(next(source.parameters()), next(target.parameters()))
+        )
+        self.assertEqual(metadata["source_epoch"], 37)
+        self.assertEqual(metadata["source_best_val_loss"], 0.25)
 
 
 if __name__ == "__main__":
