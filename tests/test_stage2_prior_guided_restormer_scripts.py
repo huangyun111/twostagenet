@@ -1,5 +1,6 @@
 import argparse
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -11,6 +12,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import infer_stage2_prior_guided_restormer as infer_script  # noqa: E402
 import train_stage2_prior_guided_restormer as train_script  # noqa: E402
+from models.stage2_asymmetric_restormer_refiner import (  # noqa: E402
+    Stage2AsymmetricRestormerRefiner,
+)
 
 
 class Stage2PriorGuidedRestormerScriptsTest(unittest.TestCase):
@@ -53,6 +57,42 @@ class Stage2PriorGuidedRestormerScriptsTest(unittest.TestCase):
         self.assertAlmostEqual(summary["stage2_dolp_mae"], 0.2)
         self.assertAlmostEqual(summary["stage1_weighted_aolp_error_deg"], 30.0)
         self.assertAlmostEqual(summary["stage2_weighted_aolp_error_deg"], 20.0)
+
+    def test_infer_auto_loads_version_e_checkpoint(self) -> None:
+        source_model = Stage2AsymmetricRestormerRefiner(
+            dim=8,
+            num_blocks=(1, 1, 1),
+            num_heads=(1, 1, 1),
+            expansion=2.0,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint_path = Path(directory) / "version_e.pth"
+            torch.save(
+                {
+                    "architecture_version": "E",
+                    "model": source_model.state_dict(),
+                },
+                checkpoint_path,
+            )
+            args = argparse.Namespace(
+                checkpoint=str(checkpoint_path),
+                architecture_version="auto",
+                dim=8,
+                num_blocks=(1, 1, 1),
+                num_heads=(1, 1, 1),
+                ffn_expansion=2.0,
+                residual_scale=0.5,
+                dolp_residual_scale=0.25,
+                angle_residual_scale=1.5707963267948966,
+                min_gate=0.05,
+                min_angle_gate=0.05,
+            )
+            loaded_model, architecture = infer_script.load_model(
+                args, torch.device("cpu")
+            )
+
+        self.assertEqual(architecture, "E")
+        self.assertIsInstance(loaded_model, Stage2AsymmetricRestormerRefiner)
 
 
 if __name__ == "__main__":

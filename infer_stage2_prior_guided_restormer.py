@@ -1,4 +1,4 @@
-"""Infer Version D reliability-gated Restormer Stage 2 refiner."""
+"""Infer Version D or Version E prior-guided Restormer Stage 2 refiners."""
 
 from __future__ import annotations
 
@@ -30,6 +30,9 @@ from infer_stage2_angular_refiner import (  # noqa: E402
 from models.stage2_prior_guided_restormer_refiner import (  # noqa: E402
     Stage2PriorGuidedRestormerRefiner,
 )
+from models.stage2_asymmetric_restormer_refiner import (  # noqa: E402
+    Stage2AsymmetricRestormerRefiner,
+)
 from train_direct_unetpp_baseline import resolve_device, strip_module_prefix  # noqa: E402
 from train_stage2_prior_guided_restormer import parse_int_tuple  # noqa: E402
 
@@ -44,6 +47,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset_root", type=str, default="")
     parser.add_argument("--split", choices=("train", "val", "test", "all"), default="test")
     parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument(
+        "--architecture_version",
+        choices=("auto", "D", "E"),
+        default="auto",
+        help="Use checkpoint metadata by default, or require a specific architecture.",
+    )
     parser.add_argument(
         "--output_dir",
         type=str,
@@ -72,8 +81,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_heads", type=lambda value: parse_int_tuple(value, 3), default=(1, 2, 4))
     parser.add_argument("--ffn_expansion", type=float, default=2.66)
     parser.add_argument("--residual_scale", type=float, default=0.5)
+    parser.add_argument("--dolp_residual_scale", type=float, default=0.25)
     parser.add_argument("--angle_residual_scale", type=float, default=math.pi / 2.0)
     parser.add_argument("--min_gate", type=float, default=0.05)
+    parser.add_argument("--min_angle_gate", type=float, default=0.05)
     parser.add_argument("--num_shards", type=int, default=1)
     parser.add_argument("--shard_index", type=int, default=0)
     return parser.parse_args()
@@ -115,22 +126,53 @@ def build_dataset(args: argparse.Namespace) -> Stage2ManifestDataset | Stage2Res
     return dataset
 
 
-def load_model(args: argparse.Namespace, device: torch.device) -> Stage2PriorGuidedRestormerRefiner:
-    model = Stage2PriorGuidedRestormerRefiner(
-        dim=args.dim,
-        num_blocks=args.num_blocks,
-        num_heads=args.num_heads,
-        expansion=args.ffn_expansion,
-        residual_scale=args.residual_scale,
-        angle_residual_scale=args.angle_residual_scale,
-        min_gate=args.min_gate,
-    )
+def load_model(
+    args: argparse.Namespace,
+    device: torch.device,
+) -> tuple[torch.nn.Module, str]:
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
+    checkpoint_architecture = str(checkpoint.get("architecture_version", "D")).upper()
+    architecture_version = (
+        checkpoint_architecture
+        if args.architecture_version == "auto"
+        else args.architecture_version
+    )
+    if architecture_version not in {"D", "E"}:
+        raise ValueError(f"Unsupported architecture_version: {architecture_version}")
+    if (
+        args.architecture_version != "auto"
+        and checkpoint_architecture in {"D", "E"}
+        and checkpoint_architecture != architecture_version
+    ):
+        raise ValueError(
+            f"Checkpoint architecture {checkpoint_architecture} does not match "
+            f"requested {architecture_version}."
+        )
+    if architecture_version == "E":
+        model: torch.nn.Module = Stage2AsymmetricRestormerRefiner(
+            dim=args.dim,
+            num_blocks=args.num_blocks,
+            num_heads=args.num_heads,
+            expansion=args.ffn_expansion,
+            dolp_residual_scale=args.dolp_residual_scale,
+            angle_residual_scale=args.angle_residual_scale,
+            min_angle_gate=args.min_angle_gate,
+        )
+    else:
+        model = Stage2PriorGuidedRestormerRefiner(
+            dim=args.dim,
+            num_blocks=args.num_blocks,
+            num_heads=args.num_heads,
+            expansion=args.ffn_expansion,
+            residual_scale=args.residual_scale,
+            angle_residual_scale=args.angle_residual_scale,
+            min_gate=args.min_gate,
+        )
     state_dict = checkpoint.get("model", checkpoint.get("model_state_dict", checkpoint))
     model.load_state_dict(strip_module_prefix(state_dict))
     model.to(device)
     model.eval()
-    return model
+    return model, architecture_version
 
 
 def summarize_rows(rows: list[dict[str, float | str]]) -> dict[str, float]:
@@ -175,7 +217,7 @@ def main() -> None:
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
     )
-    model = load_model(args, device)
+    model, architecture_version = load_model(args, device)
     rows: list[dict[str, float | str]] = []
     processed = 0
     resized_count = 0
@@ -231,8 +273,12 @@ def main() -> None:
     write_metrics_csv(output_dir / "metrics.csv", rows)
     summary = summarize_rows(rows)
     payload = {
-        "model_type": "stage2_reliability_gated_restormer_refiner_vd",
-        "architecture_version": "D",
+        "model_type": (
+            "stage2_asymmetric_restormer_refiner_ve"
+            if architecture_version == "E"
+            else "stage2_reliability_gated_restormer_refiner_vd"
+        ),
+        "architecture_version": architecture_version,
         "samples": len(rows),
         "checkpoint": args.checkpoint,
         "stage1_dir": args.stage1_dir,
