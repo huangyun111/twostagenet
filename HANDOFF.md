@@ -164,3 +164,22 @@ The running-training instructions below were completed and are superseded by the
   `/home/hy/twostage/stage2_asymmetric_restormer_ve_hammer.launch.log`.
 - Do not run HAMMER test automatically when training finishes. Select the
   candidate from validation logs first and discuss the final test separately.
+
+## Version E HAMMER Formal Test Complete (2026-07-14)
+
+- Version E completed all 80 epochs. Validation-only selection chose epoch 72
+  `best_val.pth` with validation loss `2.275343`.
+- The one-time frozen HAMMER test completed on all 1414 frames. It used the
+  then-free GPUs `5,6,7`; GPUs `0-4` were occupied by other users and untouched.
+- All three shards merged successfully into exactly 1414 unique metric rows;
+  no output resizing was used.
+- Version E metrics: DoLP MAE `0.05264502`, RMSE `0.08613873`, vector
+  `0.86430826`, weighted AoLP `24.310546°`, high-DoLP AoLP `23.101310°`.
+- In the same formal protocol, Version E is lower than both Version D and
+  Direct U-Net++ on all five reported metrics. DoLP MAE/RMSE are respectively
+  31.89%/30.70% lower than Version D and 9.99%/8.62% lower than Direct U-Net++.
+- Do not tune or select another checkpoint using this frozen test result.
+- Local result package: `results_hammer_ve/`.
+- Remote formal output:
+  `/home/hy/twostage/stage2_asymmetric_restormer_ve_hammer_test_outputs`.
+- Result figure: `results_hammer_ve/hammer_ve_formal_results.png`.

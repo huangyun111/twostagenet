@@ -1,0 +1,20 @@
+{
+  "aop_mae_deg": 29.131435100226287,
+  "checkpoint": "/home/hy/twostagenet/checkpoints_direct_unetpp_hammer/best_val.pth",
+  "cos_mae": 0.5821671221600226,
+  "cos_sin_vector_error": 0.873682461963516,
+  "dolp_mae": 0.05849018652924722,
+  "dolp_rmse": 0.0942613371559636,
+  "dop_mae": 0.05849018652924722,
+  "dop_rmse": 0.0942613371559636,
+  "high_dolp_aolp_error_deg": 23.610723107673827,
+  "high_dop_aop_mae_deg": 23.610723107673827,
+  "model_type": "direct_unetpp_baseline",
+  "output_resized_to_gt_count": 0,
+  "resize_output_to_gt": true,
+  "root_dir": "/home/hy/Documents/HAMMER_twostage/test",
+  "samples": 1414,
+  "sin_mae": 0.5393378112617948,
+  "weighted_aolp_error_deg": 24.951095140637907,
+  "weighted_aop_mae_deg": 24.951095140637907
+}
