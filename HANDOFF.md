@@ -268,6 +268,17 @@ The running-training instructions below were completed and are superseded by the
   `/home/hy/twostage/checkpoints_direct_nafnet_hammer_e2e`.
 - Combined pipeline log:
   `/home/hy/twostage/direct_nafnet_hammer_e2e.pipeline.log`.
-- After training finishes, `scripts/run_direct_nafnet_hammer_train_then_test.sh`
-  automatically uses `best_val.pth` for sharded test inference and writes:
-  `/home/hy/twostage/direct_nafnet_hammer_e2e_test_outputs`.
+- Training completed all 80 epochs. Validation-only selection chose epoch 29
+  with validation loss `1.0085768876`.
+- The one-time frozen HAMMER test completed before the 2026-07-15 status check,
+  using the then-free GPUs `5,6`. Two shards merged into exactly 1414 unique
+  metric rows; output resizing was requested for protocol parity but zero frames
+  required resizing.
+- Formal metrics: DoLP MAE `0.05661604`, RMSE `0.09058309`, vector
+  `0.88256796`, weighted AoLP `25.36656211°`, high-DoLP AoLP `24.19445091°`.
+- Against the same-protocol HAMMER-scratch Direct U-Net++, Direct NAFNet is
+  lower on DoLP MAE/RMSE and higher on vector and both AoLP metrics. Do not tune
+  another checkpoint from this frozen-test result.
+- Remote output: `/home/hy/twostage/direct_nafnet_hammer_e2e_test_outputs`.
+- Local result package: `results_hammer_direct_nafnet/`, including the exact
+  merged CSV, summary JSON, result note, and paper-style PNG table.

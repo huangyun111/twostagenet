@@ -1,0 +1,21 @@
+{
+  "aop_mae_deg": 29.390067447192937,
+  "checkpoint": "/home/hy/twostage/checkpoints_direct_nafnet_hammer_e2e/best_val.pth",
+  "cos_mae": 0.5943396126448349,
+  "cos_sin_vector_error": 0.8825679592566915,
+  "dolp_mae": 0.05661604073704807,
+  "dolp_rmse": 0.09058308667770706,
+  "dop_mae": 0.05661604073704807,
+  "dop_rmse": 0.09058308667770706,
+  "high_dolp_aolp_error_deg": 24.194450905838984,
+  "high_dop_aop_mae_deg": 24.194450905838984,
+  "model_type": "direct_nafnet_hammer_end_to_end",
+  "num_shards": 2,
+  "output_resized_to_gt_count": 0,
+  "resize_output_to_gt": true,
+  "root_dir": "/home/hy/Documents/HAMMER_twostage/test",
+  "samples": 1414,
+  "sin_mae": 0.5365349413903464,
+  "weighted_aolp_error_deg": 25.366562109519602,
+  "weighted_aop_mae_deg": 25.366562109519602
+}
